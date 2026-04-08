@@ -15,7 +15,16 @@ std::map<std::string, std::vector<int>> tabela_arquivos;
 std::int16_t registrar_peer(int porta_peer, std::string arquivo, int op) {
     
     if(upload == op){
-        
+        if (tabela_arquivos.find(arquivo) != tabela_arquivos.end()) {
+        return -1;
+        }
+        else{
+            
+            tabela_arquivos[arquivo].push_back(porta_peer);
+            std::cout << "[TRACKER] Peer na porta " << porta_peer << " registrou " << arquivo << " arquivos.\n";
+            
+            return 1;
+        }
 
     }
     else if(download == op){
@@ -36,16 +45,17 @@ std::int16_t registrar_peer(int porta_peer, std::string arquivo, int op) {
         
         return 1; // Sucesso
     }
+    return -1;
 }
 
 // Função chamada pelos Peers para descobrir com quem baixar
 std::vector<int> buscar_peers(int porta_peer, std::string nome_arquivo) {
     std::cout << "cliente porta " << porta_peer << " pede arquivo " << nome_arquivo << " na base de dados\n";
     if (tabela_arquivos.find(nome_arquivo) != tabela_arquivos.end()) {
-        std::cout << "cliente porta " << porta_peer << " sucesso";
+        std::cout << "cliente porta " << porta_peer << " sucesso\n";
         return tabela_arquivos[nome_arquivo];
     }
-    std::cout << "cliente porta " << porta_peer << " falha";
+    std::cout << "cliente porta " << porta_peer << " falha\n";
     return {}; // Retorna lista vazia se ninguém tiver o arquivo
 }
 
