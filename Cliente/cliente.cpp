@@ -4,6 +4,11 @@
 #include "rpc/server.h"
 #include "rpc/client.h"
 #include <exception>
+#include <filesystem> // Para ler pastas e verificar arquivos
+#include <fstream>    // Para criar e escrever nos arquivos .txt
+#include <limits>
+
+namespace fs = std::filesystem;
 
 #define download 1
 #define upload 2
@@ -11,61 +16,110 @@
 // --- 2. COMUNICAÇÃO COM O TRACKER (Cliente) ---
 rpc::client tracker("127.0.0.1", 8000);
 int minha_porta;
+std::string meu_usuario;
+std::string meu_diretorio;
 std::vector<std::string> meus_arquivos;
 
 // Função SERVIDORA deste peer: exposta para outros peers baixarem arquivos
+// Função SERVIDORA deste peer: exposta para outros peers baixarem arquivos
 std::vector<char> transferir_arquivo(std::string nome_arquivo) {
-    // Aqui entrará a lógica real de leitura do disco futuramente.
-    // Simulando a leitura de um arquivo em bytes:
-    std::string conteudo = "Conteudo binario do arquivo " + nome_arquivo;
-    std::cout << "[PEER] Enviando arquivo: " << nome_arquivo << "\n";
-    return std::vector<char>(conteudo.begin(), conteudo.end());
+    std::string caminho_completo = meu_diretorio + "/" + nome_arquivo;
+    std::cout << "[PEER SERVIDOR] Pedido de download recebido para: " << nome_arquivo << "\n";
+
+    // Abre o arquivo em modo binário. 
+    // O 'ate' (at end) já abre com o cursor no final para descobrirmos o tamanho do arquivo
+    std::ifstream arquivo(caminho_completo, std::ios::binary | std::ios::ate);
+
+    if (!arquivo.is_open()) {
+        std::cout << "[ERRO] Arquivo solicitado nao foi encontrado no disco local.\n";
+        return std::vector<char>(); // Retorna um vetor vazio se falhar
+    }
+
+    // Como abrimos com 'ate', tellg() nos dá o tamanho exato do arquivo em bytes
+    std::streamsize tamanho = arquivo.tellg();
+    
+    // Volta o cursor de leitura para o começo do arquivo
+    arquivo.seekg(0, std::ios::beg);
+
+    // Cria um vetor com o tamanho exato necessário
+    std::vector<char> buffer(tamanho);
+
+    // Lê todos os bytes do arquivo físico e joga dentro do vetor
+    if (arquivo.read(buffer.data(), tamanho)) {
+        std::cout << "[PEER SERVIDOR] Enviando " << tamanho << " bytes reais pela rede.\n";
+        return buffer;
+    } else {
+        std::cout << "[ERRO] Falha ao ler os bytes do arquivo.\n";
+        return std::vector<char>();
+    }
 }
 
-void cadastra_obj(){
+void cadastra_obj() {
     std::string arquivo;
-
-    std::cout << "digite o nome do arquivo a ser cadastrado na base de dados\n";
+    std::cout << "Digite o nome do arquivo a ser cadastrado na base de dados:\n";
     std::cin >> arquivo;
 
-    int estado = tracker.call("registrar_peer",minha_porta,arquivo,upload).as<std::int16_t>();
+    std::string caminho_completo = meu_diretorio + "/" + arquivo;
 
-    if (estado == -1)
-    {
-        std::cout << "Arquivo nao registrado, renomeie o arquivo e tente novamente\n";
+    // NOVO: Verifica se o arquivo realmente existe fisicamente na pasta
+    if (!std::filesystem::exists(caminho_completo)) {
+        std::cout << "[ERRO] Arquivo '" << arquivo << "' nao encontrado na sua pasta local.\n";
+        return; 
     }
-    else if(estado == 1){
-        std::cout << "Arquivo registrado na base de dados com sucesso\n";
+
+    // Correção de int16_t para int
+    int estado = tracker.call("registrar_peer", minha_porta, arquivo, upload).as<int>();
+
+    if (estado == -1) {
+        std::cout << "Arquivo ja registrado ou erro no tracker.\n";
+    } else if (estado == 1) {
+        std::cout << "Arquivo registrado na base de dados com sucesso!\n";
         meus_arquivos.push_back(arquivo);
     }
-    
-    return;
 }
 
 void aquisicao_obj() {
     std::string arquivo_requirido;
-    std::cout << "Digite o nome do arquivo desejado\n";
+    std::cout << "Digite o nome do arquivo desejado:\n";
     std::cin >> arquivo_requirido;
 
-    std::cout << "Fazendo a busca do arquivo "<< arquivo_requirido << " no servidor...\n";
+    std::string caminho_completo = meu_diretorio + "/" + arquivo_requirido;
 
+    // NOVO: Evita baixar um arquivo que você já tem na pasta
+    if (std::filesystem::exists(caminho_completo)) {
+        std::cout << "[PEER] Voce ja possui este arquivo salvo no disco!\n";
+        return;
+    }
+
+    std::cout << "Fazendo a busca do arquivo " << arquivo_requirido << " no servidor...\n";
     auto portas = tracker.call("buscar_peers", minha_porta, arquivo_requirido).as<std::vector<int>>();
 
     if (!portas.empty()) {
-        int porta_alvo = portas[0]; // Pega o primeiro peer da lista (poderia ser aleatório no futuro)
+        int porta_alvo = portas[0]; 
         std::cout << "[PEER] Arquivo encontrado na porta " << porta_alvo << ". Conectando...\n";
         
         try {
-            // Conecta DIRETAMENTE no outro peer, ignorando o tracker
             rpc::client outro_peer("127.0.0.1", porta_alvo);
             auto dados_arquivo = outro_peer.call("transferir_arquivo", arquivo_requirido).as<std::vector<char>>();
             
-            std::cout << "[PEER] Download concluido! Recebidos " << dados_arquivo.size() << " bytes.\n";
+            // === NOVO: SALVANDO O DOWNLOAD NO DISCO ===
+            // std::ios::binary garante que o C++ não corrompa arquivos se não for TXT
+            std::ofstream arquivo_saida(caminho_completo, std::ios::binary); 
+            
+            if (arquivo_saida.is_open()) {
+                // Despeja o vetor de bytes recebido direto para dentro do arquivo
+                arquivo_saida.write(dados_arquivo.data(), dados_arquivo.size());
+                arquivo_saida.close();
+                
+                std::cout << "[PEER] Download concluido e salvo fisicamente! Recebidos " << dados_arquivo.size() << " bytes.\n";
 
-            // AUTO-SEEDING: Avisa o tracker que agora você também é fonte deste arquivo!
-            tracker.call("registrar_peer", minha_porta, arquivo_requirido,download);
-            meus_arquivos.push_back(arquivo_requirido);
-            std::cout << "[PEER] Arquivo registrado no tracker localmente. Voce agora e um seeder!\n";
+                // AUTO-SEEDING
+                tracker.call("registrar_peer", minha_porta, arquivo_requirido, download);
+                meus_arquivos.push_back(arquivo_requirido);
+                std::cout << "[PEER] Arquivo registrado. Voce agora e um seeder!\n";
+            } else {
+                std::cout << "[ERRO] Permissao negada para salvar o arquivo na pasta.\n";
+            }
 
         } catch (const std::exception& e) {
             std::cout << "[ERRO] Falha ao conectar no Peer da porta " << porta_alvo << "\n";
@@ -77,12 +131,104 @@ void aquisicao_obj() {
     }
 }
 
+void criar_arquivo_txt() {
+    std::string nome_arquivo;
+    std::string conteudo;
+
+    std::cout << "Digite o nome do novo arquivo (ex: meu_texto.txt): ";
+    std::cin >> nome_arquivo;
+
+    // Limpa o buffer do teclado antes de ler uma frase com espaços
+    std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+
+    std::cout << "Digite o conteudo do arquivo:\n";
+    std::getline(std::cin, conteudo);
+
+    // Cria o caminho completo (ex: ./pasta_Rai/meu_texto.txt)
+    std::string caminho_completo = meu_diretorio + "/" + nome_arquivo;
+    
+    std::ofstream arquivo(caminho_completo); // Abre o arquivo para escrita
+    
+    if (arquivo.is_open()) {
+        arquivo << conteudo; // Escreve o texto no arquivo físico
+        arquivo.close();
+        std::cout << "[SISTEMA] Arquivo '" << nome_arquivo << "' criado com sucesso no disco!\n";
+
+        // Aproveita e já registra o arquivo recém-criado no Tracker
+        int estado = tracker.call("registrar_peer", minha_porta, nome_arquivo, upload).as<int>();
+        if (estado == 1) {
+            meus_arquivos.push_back(nome_arquivo);
+            std::cout << "[TRACKER] Arquivo disponibilizado na rede!\n";
+        }
+    } else {
+        std::cout << "[ERRO] Falha ao criar o arquivo no disco.\n";
+    }
+}
+
+// Cria um arquivo TXT com texto aleatório dentro da pasta do usuário
+void criar_arquivo_aleatorio(std::string nome_arquivo) {
+    std::string caminho_completo = meu_diretorio + "/" + nome_arquivo;
+    
+    // std::ofstream serve para escrever em arquivos
+    std::ofstream arquivo(caminho_completo);
+    if (arquivo.is_open()) {
+        int numero_randomico = rand() % 10000; // Gera um número de 0 a 9999
+        arquivo << "Este arquivo pertence a " << meu_usuario << "\n";
+        arquivo << "Chave de seguranca (randomica): " << numero_randomico << "\n";
+        arquivo.close();
+        std::cout << "[SISTEMA] Arquivo '" << nome_arquivo << "' criado com sucesso.\n";
+    } else {
+        std::cout << "[ERRO] Nao foi possivel criar o arquivo no disco.\n";
+    }
+}
+
+// Verifica se a pasta existe, cria se não existir, e registra o que achar
+void inicializar_sistema_de_arquivos() {
+    meu_diretorio = "./pasta_" + meu_usuario;
+
+    // 1. Verifica se a pasta existe
+    if (!fs::exists(meu_diretorio)) {
+        std::cout << "[SISTEMA] Novo usuario detectado! Criando pasta: " << meu_diretorio << "\n";
+        fs::create_directory(meu_diretorio);
+        
+        // Como é um usuário novo, vamos gerar um arquivo inicial para ele ter o que compartilhar
+        criar_arquivo_aleatorio("boas_vindas.txt");
+    } else {
+        std::cout << "[SISTEMA] Bem-vindo de volta, " << meu_usuario << "!\n";
+    }
+
+    // 2. Varre a pasta inteira e registra tudo no Tracker
+    std::cout << "[SISTEMA] Sincronizando arquivos locais com o Tracker...\n";
+    
+    // O directory_iterator passa por todos os arquivos dentro da pasta
+    for (const auto& entrada : fs::directory_iterator(meu_diretorio)) {
+        if (entrada.is_regular_file()) { // Garante que é um arquivo e não outra sub-pasta
+            
+            // Pega apenas o nome do arquivo (ex: "boas_vindas.txt") ignorando o caminho
+            std::string nome_arq = entrada.path().filename().string(); 
+            
+            // Registra no tracker usando a lógica que já construímos
+            tracker.call("registrar_peer", minha_porta, nome_arq, upload).as<int>();
+            meus_arquivos.push_back(nome_arq);
+            
+            std::cout << " -> [" << nome_arq << "] registrado como Seeder.\n";
+        }
+    }
+    std::cout << "[SISTEMA] Sincronizacao concluida. " << meus_arquivos.size() << " arquivos semeados.\n";
+}
+
 int main(int argc, char *argv[]) {
-    if (argc < 2) {
-        std::cerr << "Uso: ./peer <sua_porta>\n";
+    if (argc < 3) {
+        std::cerr << "Uso: ./cliente <sua_porta> <nome_usuario>\n";
+        std::cerr << "Exemplo: ./cliente 8081 Rai\n";
         return 1;
     }
+    
     minha_porta = std::stoi(argv[1]);
+    meu_usuario = argv[2]; // Salva o nome de usuário
+
+    // Inicia a sincronização de pastas ANTES de abrir o menu!
+    inicializar_sistema_de_arquivos();
 
     // --- 1. INICIA O SERVIDOR (Background) ---
     rpc::server srv(minha_porta);
@@ -93,7 +239,7 @@ int main(int argc, char *argv[]) {
     int op = 0; // CORREÇÃO: Variável inicializada
 
     while(op != -1){
-        std::cout << "\n1: Cadastrar arquivo | 2: Baixar arquivo | -1: Sair\nEscolha: ";
+        std::cout << "\n1: Cadastrar arquivo | 2: Baixar arquivo | 3: Criar aruivo | -1: Sair\nEscolha: ";
         std::cin >> op;
 
         switch (op) {
@@ -106,6 +252,8 @@ int main(int argc, char *argv[]) {
             case 2:
                 aquisicao_obj();
                 break;
+            case 3:
+                criar_arquivo_txt();
             default:
                 std::cout << "Operacao nao definida, tente novamente\n";
                 break;
