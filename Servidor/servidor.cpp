@@ -3,22 +3,38 @@
 #include <string>
 #include <map>
 #include "rpc/server.h"
+#include <algorithm>
+
+#define download 1
+#define upload 2
 
 // Banco de dados em memória: Nome do Arquivo -> Lista de Portas que o possuem
 std::map<std::string, std::vector<int>> tabela_arquivos;
 
 // Função chamada pelos Peers quando entram na rede
-std::int16_t registrar_peer(int porta_peer, std::string arquivo) {
+std::int16_t registrar_peer(int porta_peer, std::string arquivo, int op) {
     
-    if (tabela_arquivos.find(arquivo) != tabela_arquivos.end()) {
-        return -1;
+    if(upload == op){
+        
+
     }
-    else{
+    else if(download == op){
+        // Acessa a lista de portas para este arquivo (se não existir, o C++ cria uma lista vazia)
+        auto& lista_portas = tabela_arquivos[arquivo];
+
+        // Verifica se ESTA porta já está na lista deste arquivo para evitar duplicatas
+        if (std::find(lista_portas.begin(), lista_portas.end(), porta_peer) != lista_portas.end()) {
+            std::cout << "[TRACKER] O Peer da porta " << porta_peer << " ja havia registrado o arquivo " << arquivo << ".\n";
+            return 0; // Retorna 0 (ou outro código de sua escolha) indicando que já estava cadastrado
+        }
+
+        // Se não encontrou a porta na lista, adiciona! 
+        // (Funciona tanto para o primeiro peer quanto para o décimo peer com o mesmo arquivo)
+        lista_portas.push_back(porta_peer);
         
-        tabela_arquivos[arquivo].push_back(porta_peer);
-        std::cout << "[TRACKER] Peer na porta " << porta_peer << " registrou " << arquivo << " arquivos.\n";
+        std::cout << "[TRACKER] Peer na porta " << porta_peer << " registrou o arquivo: " << arquivo << "\n";
         
-        return 1;
+        return 1; // Sucesso
     }
 }
 
