@@ -7,6 +7,8 @@
 #include <filesystem> // Para ler pastas e verificar arquivos
 #include <fstream>    // Para criar e escrever nos arquivos .txt
 #include <limits>
+#include <thread>
+#include <chrono>
 
 namespace fs = std::filesystem;
 
@@ -19,6 +21,114 @@ int minha_porta;
 std::string meu_usuario;
 std::string meu_diretorio;
 std::vector<std::string> meus_arquivos;
+
+struct EstadoLocal {
+    int versao;
+    std::filesystem::file_time_type ultima_modificacao;
+};
+
+std::map<std::string, EstadoLocal> meus_arquivos_estados;
+
+void fazer_download(std::string nome_arq){
+    std::string caminho_completo = meu_diretorio + "/" + nome_arq;
+    auto portas = tracker.call("buscar_peers", minha_porta, nome_arq).as<std::vector<int>>();
+
+    if (!portas.empty()) {
+        int porta_alvo = portas[0]; 
+        std::cout << "[PEER] Atualizando o arquivo vindo da " << porta_alvo << "\n";
+        
+        try {
+            rpc::client outro_peer("127.0.0.1", porta_alvo);
+            auto dados_arquivo = outro_peer.call("transferir_arquivo", nome_arq).as<std::vector<char>>();
+            
+            // === NOVO: SALVANDO O DOWNLOAD NO DISCO ===
+            // std::ios::binary garante que o C++ não corrompa arquivos se não for TXT
+            std::ofstream arquivo_saida(caminho_completo, std::ios::binary); 
+            
+            if (arquivo_saida.is_open()) {
+                // Despeja o vetor de bytes recebido direto para dentro do arquivo
+                arquivo_saida.write(dados_arquivo.data(), dados_arquivo.size());
+                arquivo_saida.close();
+                
+                std::cout << "[PEER] Download concluido e salvo fisicamente! Recebidos " << dados_arquivo.size() << " bytes.\n";
+
+                // AUTO-SEEDING
+                tracker.call("registrar_peer", minha_porta, nome_arq, download);
+                meus_arquivos.push_back(nome_arq);
+                std::cout << "[PEER] Arquivo registrado. Voce agora e um seeder!\n";
+            } else {
+                std::cout << "[ERRO] Permissao negada para salvar o arquivo na pasta.\n";
+            }
+
+        } catch (const std::exception& e) {
+            std::cout << "[ERRO] Falha ao conectar no Peer da porta " << porta_alvo << "\n";
+            std::cout << "Motivo técnico: " << e.what() << "\n";
+        }
+    }
+}
+
+void sincronizador_automatico() {
+    while (true) {
+        std::this_thread::sleep_for(std::chrono::seconds(5));
+
+        // 1. VARRE A PASTA FÍSICA PARA ACHAR MUDANÇAS LOCAIS
+        for (const auto& entrada : fs::directory_iterator(meu_diretorio)) {
+            if (entrada.is_regular_file()) {
+                std::string nome_arq = entrada.path().filename().string();
+                auto tempo_atual = std::filesystem::last_write_time(entrada.path());
+
+                // Se o arquivo NÃO EXISTE no nosso mapa local, é um arquivo novo!
+                if (meus_arquivos_estados.find(nome_arq) == meus_arquivos_estados.end()) {
+                    std::cout << "\n[AUTO-SYNC] Novo arquivo detetado localmente: " << nome_arq << "\n";
+                    
+                    // Registra no Tracker como um upload normal
+                    int nova_v = tracker.call("registrar_peer", minha_porta, nome_arq, upload).as<int>();
+                    
+                    // Adiciona ao nosso mapa de monitoramento
+                    meus_arquivos_estados[nome_arq] = {nova_v, tempo_atual};
+                    
+                } 
+                // Se o arquivo JÁ EXISTE no mapa, verifica se o horário de modificação mudou
+                else if (tempo_atual > meus_arquivos_estados[nome_arq].ultima_modificacao) {
+                    std::cout << "\n[AUTO-SYNC] Mudança local detetada em: " << nome_arq << " (Ctrl+S funcionou!)\n";
+                    
+                    // Avisa o Tracker que o arquivo foi atualizado (sobe a versão)
+                    int nova_v = tracker.call("atualizar_arquivo", minha_porta, nome_arq).as<int>();
+                    int versao_atual = tracker.call("verificar_versao",nome_arq).as<int>();
+                    meus_arquivos_estados[nome_arq].versao = versao_atual;
+                    
+                    // Atualiza o estado local para não disparar de novo no próximo segundo
+                    meus_arquivos_estados[nome_arq].versao = nova_v;
+                    meus_arquivos_estados[nome_arq].ultima_modificacao = tempo_atual;
+                }
+                else{
+                    
+                    int versao_rede = tracker.call("verificar_versao",nome_arq).as<int>();
+                    if (versao_rede > meus_arquivos_estados[nome_arq].versao)
+                    {
+    
+                        std::cout << "\n[AUTO-SYNC] Baixando versao atualizada (v" << versao_rede << ") de " << nome_arq << "...\n";
+                        
+                        fazer_download(nome_arq); 
+
+                        // === A CORREÇÃO MÁGICA ENTRA AQUI ===
+                        // Após o download terminar e o arquivo físico ter sido sobrescrito,
+                        // lemos a NOVA data de modificação gerada pelo sistema operacional.
+                        auto nova_data_fisica = std::filesystem::last_write_time(entrada.path());
+                        
+                        // Atualizamos nosso mapa para que o próximo loop ignore essa mudança de data
+                        meus_arquivos_estados[nome_arq].versao = versao_rede;
+                        meus_arquivos_estados[nome_arq].ultima_modificacao = nova_data_fisica;
+                        
+                        std::cout << "[AUTO-SYNC] Arquivo atualizado para a versão " << versao_rede << " com sucesso!\n";
+                    }
+                    
+                    
+                }
+            }
+        }
+    }
+}
 
 // Função SERVIDORA deste peer: exposta para outros peers baixarem arquivos
 // Função SERVIDORA deste peer: exposta para outros peers baixarem arquivos
@@ -78,7 +188,9 @@ void cadastra_obj() {
     }
 }
 
+
 void aquisicao_obj() {
+    
     std::string arquivo_requirido;
     std::cout << "Digite o nome do arquivo desejado:\n";
     std::cin >> arquivo_requirido;
@@ -210,6 +322,9 @@ void inicializar_sistema_de_arquivos() {
             // Registra no tracker usando a lógica que já construímos
             tracker.call("registrar_peer", minha_porta, nome_arq, upload).as<int>();
             meus_arquivos.push_back(nome_arq);
+
+            auto tempo_mod = std::filesystem::last_write_time(entrada.path());
+            meus_arquivos_estados[nome_arq] = {1, tempo_mod}; 
             
             std::cout << " -> [" << nome_arq << "] registrado como Seeder.\n";
         }
@@ -235,6 +350,9 @@ int main(int argc, char *argv[]) {
     srv.bind("transferir_arquivo", &transferir_arquivo);
     srv.async_run(1); 
     std::cout << "[PEER] Escutando pedidos na porta " << minha_porta << "...\n";
+
+    std::thread thread_sync(sincronizador_automatico);
+    thread_sync.detach(); // Deixa-a correr livremente em background
 
     int op = 0; // CORREÇÃO: Variável inicializada
 
