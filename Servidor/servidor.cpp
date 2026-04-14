@@ -2,45 +2,82 @@
 #include <vector>
 #include <string>
 #include <map>
-#include "rpc/server.h"
 #include <algorithm>
+#include <fstream>
+#include <thread> 
+#include <chrono> 
+#include <shared_mutex>  
+#include <mutex>
+
+#include "rpc/server.h"
 #include <nlohmann/json.hpp>
-#include <fstream> // Para ler e escrever o arquivo .json#include <nlohmann/json.hpp>
 
 using json = nlohmann::json;
 
 #define download 1
 #define upload 2
+#define privado 3
+#define somente_leitura 4
+#define escrita 5
 
 struct MetadadosArquivo {
     std::string criador;
     int tamanho_bytes;
     int versao;
-    std::vector<int> seeders;
+    int permisao;
+    std::vector<std::string> usuarios_seeders; 
 };
 
-NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(MetadadosArquivo, criador, tamanho_bytes, versao, seeders)
+struct Usuario {
+    std::string nome;
+    std::string ip;
+    int porta;
+    int status_vivo; // NOVO: 1 = Vivo, 0 = Ausente/Suspeito
+};
 
-// Banco de dados em memória: Nome do Arquivo -> Lista de Portas que o possuem
+NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(MetadadosArquivo, criador, tamanho_bytes, versao, permisao, usuarios_seeders)
+
 std::map<std::string, MetadadosArquivo> tabela_arquivos;
+std::map<std::string, Usuario> tabela_usuarios_conectados;
 
-// Salva todo o mapa atual num arquivo físico chamado "tracker_state.json"
+// Cadeado para proteger a tabela_usuarios_conectados de colisões de Threads
+std::shared_mutex mtx_usuarios;
+
+// Função chamada pelo Cliente logo ao abrir o terminal
+void registrar_usuario_rede(std::string nome, std::string ip, int porta) {
+    std::shared_lock<std::shared_mutex> lock_escrita(mtx_usuarios); // Tranca antes de mexer
+    
+    // Cadastra já com status_vivo = 1
+    tabela_usuarios_conectados[nome] = {nome, ip, porta, 1};
+    std::cout << "[TRACKER] Usuario " << nome << " logado em " << ip << ":" << porta << "\n";
+}
+
+// Função para o Tracker atualizar o IP caso o notebook do cliente mude de rede
+int atualizar_ip_usuario(std::string nome, std::string novo_ip) {
+    std::lock_guard<std::shared_mutex> lock_escrita(mtx_usuarios);
+    if (tabela_usuarios_conectados.count(nome)) {
+        tabela_usuarios_conectados[nome].ip = novo_ip;
+        std::cout << "[TRACKER] Usuario " << nome << " mudou de rede. Novo IP: " << novo_ip << "\n";
+        return 1;
+    }
+    return 0;
+}
+
 void salvar_estado() {
     std::ofstream arquivo("tracker_state.json");
     if (arquivo.is_open()) {
-        json j = tabela_arquivos; // Converte o mapa inteiro para JSON
-        arquivo << j.dump(4);     // Grava no arquivo com indentação de 4 espaços (bonito para ler)
+        json j = tabela_arquivos; 
+        arquivo << j.dump(4);     
         arquivo.close();
     }
 }
 
-// Lê o arquivo JSON quando o Tracker é reiniciado e devolve para a memória
 void carregar_estado() {
     std::ifstream arquivo("tracker_state.json");
     if (arquivo.is_open()) {
         json j;
-        arquivo >> j; // Lê o texto do arquivo para o objeto json
-        tabela_arquivos = j.get<std::map<std::string, MetadadosArquivo>>(); // Converte de volta para C++
+        arquivo >> j; 
+        tabela_arquivos = j.get<std::map<std::string, MetadadosArquivo>>(); 
         arquivo.close();
         std::cout << "[TRACKER] Estado anterior carregado! " << tabela_arquivos.size() << " arquivos conhecidos.\n";
     } else {
@@ -48,90 +85,144 @@ void carregar_estado() {
     }
 }
 
-int atualizar_arquivo(int porta_peer, std::string arquivo) {
-    // Verifica se o arquivo realmente existe na rede
+int atualizar_arquivo(std::string nome_usuario, std::string arquivo) {
     if (tabela_arquivos.find(arquivo) != tabela_arquivos.end()) {
         auto& meta = tabela_arquivos[arquivo];
         
-        meta.versao += 1; // Sobe a versão do arquivo
+        // === CORREÇÃO DA PERMISSÃO ===
+        // Se NÃO é o dono E a permissão NÃO é de escrita pública -> Bloqueia!
+        if (meta.criador != nome_usuario && meta.permisao != escrita) {
+            std::cout << "[TRACKER] BLOQUEADO: " << nome_usuario << " tentou modificar '" << arquivo << "' (Dono: " << meta.criador << ")\n";
+            return -2; 
+        }
+
+        meta.versao += 1; 
+        meta.usuarios_seeders.clear(); 
+        meta.usuarios_seeders.push_back(nome_usuario);
         
-        // CRÍTICO: Limpa a lista de seeders antigos, pois os arquivos deles estão desatualizados!
-        meta.seeders.clear(); 
-        
-        // Adiciona apenas você como seeder da nova versão
-        meta.seeders.push_back(porta_peer);
-        
-        std::cout << "[TRACKER] Peer " << porta_peer << " ATUALIZOU o arquivo '" << arquivo << "' para a versao " << meta.versao << ".\n";
-        
-        salvar_estado(); // Grava no JSON
-        return meta.versao; // Retorna a nova versão para o cliente
+        std::cout << "[TRACKER] " << nome_usuario << " ATUALIZOU '" << arquivo << "' para v" << meta.versao << ".\n";
+        salvar_estado(); 
+        return meta.versao; 
     }
-    
-    return -1; // Erro: Tentou atualizar um arquivo que não existe no Tracker
+    return -1; 
 }
 
-int verificar_versao(std::string arquivo) {
+// ATENÇÃO: Mudou a assinatura! Agora recebe o nome_usuario
+int verificar_versao(std::string nome_usuario, std::string arquivo) {
+    
+    { // Escopo para o lock_guard não travar tudo à toa
+        std::lock_guard<std::shared_mutex> lock_escrita(mtx_usuarios);
+        // Se o usuário existe, atualiza o status de vida dele para 1
+        if (tabela_usuarios_conectados.count(nome_usuario)) {
+            tabela_usuarios_conectados[nome_usuario].status_vivo = 1;
+        }
+    }
+
     if (tabela_arquivos.find(arquivo) != tabela_arquivos.end()) {
         return tabela_arquivos[arquivo].versao;
     }
-    return 0; // Retorna 0 se o arquivo não existe na rede
+    return 0; 
 }
 
-// Função chamada pelos Peers quando entram na rede
-int registrar_peer(int porta_peer, std::string arquivo, int op) {
-    
-    // Se o arquivo NÃO existe na base, criamos os metadados do zero
+// O registro agora é vinculado ao NOME, não à porta
+int registrar_peer(std::string nome_usuario, std::string arquivo,int permisao, int op) {
     if (tabela_arquivos.find(arquivo) == tabela_arquivos.end()) {
         if (op == upload) {
             MetadadosArquivo meta;
-            meta.criador = "Porta_" + std::to_string(porta_peer); // Simplificação inicial
-            meta.tamanho_bytes = 0; // (Poderemos passar o tamanho real futuramente via RPC)
-            meta.versao = 1;        // Começa na versão 1
-            meta.seeders.push_back(porta_peer);
+            meta.criador = nome_usuario; // O usuário vira o dono soberano
+            meta.tamanho_bytes = 0; 
+            meta.versao = 1;  
+            meta.permisao = permisao;      
+            meta.usuarios_seeders.push_back(nome_usuario);
             
             tabela_arquivos[arquivo] = meta;
-            std::cout << "[TRACKER] Novo arquivo '" << arquivo << "' registrado v" << meta.versao << ".\n";
+            std::cout << "[TRACKER] Novo arquivo '" << arquivo << "' registrado por " << nome_usuario << ".\n";
         } else {
-            return -1; // Tentou fazer download/registrar algo que não existe
+            return -1; 
         }
     } 
-    // Se o arquivo JÁ EXISTE, apenas adicionamos o peer na lista de seeders (se ele já não estiver lá)
     else {
-        auto& seeders = tabela_arquivos[arquivo].seeders;
-        if (std::find(seeders.begin(), seeders.end(), porta_peer) == seeders.end()) {
-            seeders.push_back(porta_peer);
-            std::cout << "[TRACKER] Peer " << porta_peer << " virou seeder de '" << arquivo << "'.\n";
+        auto& seeders = tabela_arquivos[arquivo].usuarios_seeders;
+        if (std::find(seeders.begin(), seeders.end(), nome_usuario) == seeders.end()) {
+            seeders.push_back(nome_usuario);
+            std::cout << "[TRACKER] " << nome_usuario << " virou seeder de '" << arquivo << "'.\n";
         }
     }
 
-    // SALVA NO DISCO SEMPRE QUE A BASE MUDAR!
     salvar_estado();
     return 1;
 }
 
-// Função chamada pelos Peers para descobrir com quem baixar
-std::vector<int> buscar_peers(int porta_peer, std::string nome_arquivo) {
-    std::cout << "cliente porta " << porta_peer << " pede arquivo " << nome_arquivo << " na base de dados\n";
+// NOVO: Devolve uma lista de pares contendo {IP, PORTA} de quem tem o arquivo
+std::vector<std::pair<std::string, int>> buscar_peers(std::string nome_usuario, std::string nome_arquivo) {
+    std::vector<std::pair<std::string, int>> enderecos_disponiveis;
+    
+    std::cout << "O usuario " << nome_usuario << " pede enderecos para o arquivo " << nome_arquivo << "...\n";
+    
     if (tabela_arquivos.find(nome_arquivo) != tabela_arquivos.end()) {
-        std::cout << "cliente porta " << porta_peer << " sucesso\n";
-        return tabela_arquivos[nome_arquivo].seeders;
+        if(tabela_arquivos[nome_arquivo].permisao != privado || tabela_arquivos[nome_arquivo].criador == nome_usuario){    
+            // Colocamos o cadeado AQUI, antes de varrer e acessar a tabela de usuários!
+            std::shared_lock<std::shared_mutex> lock_leitura(mtx_usuarios); 
+            
+            for (const auto& nome_seeder : tabela_arquivos[nome_arquivo].usuarios_seeders) {
+                
+                // O .count() e o acesso [] agora estão 100% protegidos contra o Ceifador
+                if (nome_seeder != nome_usuario && tabela_usuarios_conectados.count(nome_seeder)) {
+                    Usuario u = tabela_usuarios_conectados[nome_seeder];
+                    enderecos_disponiveis.push_back({u.ip, u.porta});
+                }
+            }
+        }
+        else{
+            std::cout << "[TRACKER] " << nome_usuario << " nao tem permissao de download do arquivo " << nome_arquivo << ".\n";
+        }
     }
-    std::cout << "cliente porta " << porta_peer << " falha\n";
-    return {}; // Retorna lista vazia se ninguém tiver o arquivo
+    
+    return enderecos_disponiveis;
+}
+
+void limpador_de_peers_inativos() {
+    while (true) {
+        // Roda o varredor a cada 15 segundos
+        // (Recomendo deixar um tempo maior que o sleep do Cliente para evitar falsos positivos)
+        std::this_thread::sleep_for(std::chrono::seconds(15));
+
+        std::lock_guard<std::shared_mutex> lock_escrita(mtx_usuarios); // Tranca o mapa para a varredura
+        
+        // Usamos um iterador clássico porque vamos apagar itens do mapa enquanto andamos por ele
+        for (auto it = tabela_usuarios_conectados.begin(); it != tabela_usuarios_conectados.end(); ) {
+            
+            if (it->second.status_vivo == 0) {
+                // Se continuou 0 desde a última varredura, o usuário morreu/desconectou
+                std::cout << "[HEARTBEAT] Usuario '" << it->first << "' n\xc3\xa3o respondeu. Removendo da rede...\n";
+                
+                it = tabela_usuarios_conectados.erase(it); // Remove e avança o ponteiro
+            } 
+            else {
+                // Se estava 1, ele está vivo! Mas setamos para 0 para testá-lo no próximo ciclo
+                it->second.status_vivo = 0;
+                ++it; // Avança o ponteiro
+            }
+        }
+    }
 }
 
 int main() {
-    rpc::server srv(8000); // Controlador sempre roda na porta conhecida: 8000
+    rpc::server srv(8000); 
     carregar_estado();
 
-    // Mapeia as funções C++ para chamadas RPC
+    // Binds atualizados
+    srv.bind("registrar_usuario_rede", &registrar_usuario_rede);
     srv.bind("registrar_peer", &registrar_peer);
     srv.bind("buscar_peers", &buscar_peers);
-    srv.bind("atualizar_arquivo", &atualizar_arquivo); // <--- Faltava este!
+    srv.bind("atualizar_arquivo", &atualizar_arquivo); 
     srv.bind("verificar_versao", &verificar_versao);
-
+    srv.bind("atualizar_ip_usuario",&atualizar_ip_usuario);
+    std::cout << "[TRACKER] Iniciando sistema de Heartbeat...\n";
+    std::thread thread_heartbeat(limpador_de_peers_inativos);
+    thread_heartbeat.detach();
     std::cout << "[TRACKER] Iniciado na porta 8000. Aguardando peers...\n";
-    srv.run(); // Função síncrona, bloqueia e fica escutando requisições
+    srv.run(); 
 
     return 0;
 }
