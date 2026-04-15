@@ -44,7 +44,7 @@ struct EstadoLocal {
 };
 
 std::map<std::string, EstadoLocal> meus_arquivos_estados;
-rpc::client tracker("192.168.1.20", 8000); // Tracker Global para o Menu
+rpc::client tracker("186.217.124.198", 8000); // Tracker Global para o Menu
 
 // ========================================================
 // 1. DESCOBERTA DE REDE (IP DINÂMICO)

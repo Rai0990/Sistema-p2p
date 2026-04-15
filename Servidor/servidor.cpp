@@ -9,6 +9,12 @@
 #include <shared_mutex>  
 #include <mutex>
 
+#include <unistd.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <cstring>
+
 #include "rpc/server.h"
 #include <nlohmann/json.hpp>
 
@@ -39,7 +45,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(MetadadosArquivo, criador, tamanho_bytes, ver
 
 std::map<std::string, MetadadosArquivo> tabela_arquivos;
 std::map<std::string, Usuario> tabela_usuarios_conectados;
-
+std::string meu_ip_atual;
 // Cadeado para proteger a tabela_usuarios_conectados de colisões de Threads
 std::shared_mutex mtx_usuarios;
 
@@ -52,6 +58,37 @@ void registrar_usuario_rede(std::string nome, std::string ip, int porta) {
     std::cout << "[TRACKER] Usuario " << nome << " logado em " << ip << ":" << porta << "\n";
 }
 
+std::string obter_meu_ip() {
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) return "127.0.0.1";
+
+    struct sockaddr_in serv;
+    memset(&serv, 0, sizeof(serv));
+    serv.sin_family = AF_INET;
+    serv.sin_addr.s_addr = inet_addr("8.8.8.8"); 
+    serv.sin_port = htons(53);
+
+    // connect num socket UDP não envia dados, só resolve a rota
+    int err = connect(sock, (const struct sockaddr*)&serv, sizeof(serv));
+    if (err < 0) {
+        close(sock);
+        return "127.0.0.1";
+    }
+
+    struct sockaddr_in name;
+    socklen_t namelen = sizeof(name);
+    err = getsockname(sock, (struct sockaddr*)&name, &namelen);
+    if (err < 0) {
+        close(sock);
+        return "127.0.0.1";
+    }
+
+    const char* p = inet_ntoa(name.sin_addr);
+    std::string ip_descoberto(p);
+    close(sock);
+    
+    return ip_descoberto;
+}
 // Função para o Tracker atualizar o IP caso o notebook do cliente mude de rede
 int atualizar_ip_usuario(std::string nome, std::string novo_ip) {
     std::lock_guard<std::shared_mutex> lock_escrita(mtx_usuarios);
@@ -210,6 +247,10 @@ void limpador_de_peers_inativos() {
 int main() {
     rpc::server srv(8000); 
     carregar_estado();
+
+    meu_ip_atual = obter_meu_ip(); // Descobre o IP real nativamente
+
+    std::cout << "[SISTEMA] Inicializando com IP Local: " << meu_ip_atual << "\n";
 
     // Binds atualizados
     srv.bind("registrar_usuario_rede", &registrar_usuario_rede);
