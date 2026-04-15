@@ -38,7 +38,7 @@ struct Usuario {
     std::string nome;
     std::string ip;
     int porta;
-    int status_vivo; // NOVO: 1 = Vivo, 0 = Ausente/Suspeito
+    int status_vivo; // 1 = Vivo, 0 = Ausente
 };
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(MetadadosArquivo, criador, tamanho_bytes, versao, permisao, usuarios_seeders)
@@ -58,6 +58,7 @@ void registrar_usuario_rede(std::string nome, std::string ip, int porta) {
     std::cout << "[TRACKER] Usuario " << nome << " logado em " << ip << ":" << porta << "\n";
 }
 
+// mesmo código de obtenção de IP do cliente
 std::string obter_meu_ip() {
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (sock < 0) return "127.0.0.1";
@@ -89,6 +90,7 @@ std::string obter_meu_ip() {
     
     return ip_descoberto;
 }
+
 // Função para o Tracker atualizar o IP caso o notebook do cliente mude de rede
 int atualizar_ip_usuario(std::string nome, std::string novo_ip) {
     std::lock_guard<std::shared_mutex> lock_escrita(mtx_usuarios);
@@ -126,7 +128,6 @@ int atualizar_arquivo(std::string nome_usuario, std::string arquivo) {
     if (tabela_arquivos.find(arquivo) != tabela_arquivos.end()) {
         auto& meta = tabela_arquivos[arquivo];
         
-        // === CORREÇÃO DA PERMISSÃO ===
         // Se NÃO é o dono E a permissão NÃO é de escrita pública -> Bloqueia!
         if (meta.criador != nome_usuario && meta.permisao != escrita) {
             std::cout << "[TRACKER] BLOQUEADO: " << nome_usuario << " tentou modificar '" << arquivo << "' (Dono: " << meta.criador << ")\n";
@@ -144,7 +145,6 @@ int atualizar_arquivo(std::string nome_usuario, std::string arquivo) {
     return -1; 
 }
 
-// ATENÇÃO: Mudou a assinatura! Agora recebe o nome_usuario
 int verificar_versao(std::string nome_usuario, std::string arquivo) {
     
     { // Escopo para o lock_guard não travar tudo à toa
@@ -161,7 +161,6 @@ int verificar_versao(std::string nome_usuario, std::string arquivo) {
     return 0; 
 }
 
-// O registro agora é vinculado ao NOME, não à porta
 int registrar_peer(std::string nome_usuario, std::string arquivo,int permisao, int op) {
     if (tabela_arquivos.find(arquivo) == tabela_arquivos.end()) {
         if (op == upload) {
@@ -190,7 +189,6 @@ int registrar_peer(std::string nome_usuario, std::string arquivo,int permisao, i
     return 1;
 }
 
-// NOVO: Devolve uma lista de pares contendo {IP, PORTA} de quem tem o arquivo
 std::vector<std::pair<std::string, int>> buscar_peers(std::string nome_usuario, std::string nome_arquivo) {
     std::vector<std::pair<std::string, int>> enderecos_disponiveis;
     
@@ -260,6 +258,7 @@ int main() {
     srv.bind("verificar_versao", &verificar_versao);
     srv.bind("atualizar_ip_usuario",&atualizar_ip_usuario);
     std::cout << "[TRACKER] Iniciando sistema de Heartbeat...\n";
+    //lançamento da thread paralela
     std::thread thread_heartbeat(limpador_de_peers_inativos);
     thread_heartbeat.detach();
     std::cout << "[TRACKER] Iniciado na porta 8000. Aguardando peers...\n";
