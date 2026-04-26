@@ -10,6 +10,12 @@
 #include <chrono>
 #include <utility>
 #include <mutex>
+#include <algorithm> // Necessário para std::find
+#include <atomic>
+
+// Adição da biblioteca JSON
+#include <nlohmann/json.hpp>
+using json = nlohmann::json;
 
 // Bibliotecas Nativas de Socket do Linux para descobrir o IP
 #include <unistd.h>
@@ -22,33 +28,174 @@
 #include "rpc/server.h"
 #include "rpc/client.h"
 
-// abrevisações de funções do C++
+// abreviações de funções do C++
 namespace fs = std::filesystem;
 
-//definições de constantes utilizadas no códigos
+// definições de constantes utilizadas nos códigos
 #define download 1
 #define upload 2
 #define privado 3
 #define somente_leitura 4
 #define escrita 5
 
-// estrutura de dados para salvar os metadados dos arquivos relacionados ao cliente
+#define PAGINA 256 // 256 BYTES
+
+// ========================================================
+// ESTRUTURAS DE DADOS GLOBAIS
+// ========================================================
 struct EstadoLocal {
     int versao;
     std::filesystem::file_time_type ultima_modificacao;
     int permissao;
+    int tamanho_bytes; 
 };
 
-//variáveis de uso global
 int minha_porta;
 std::string meu_usuario;
 std::string meu_diretorio;
 std::string meu_ip_atual;
-std::mutex acesso_tabela; // variável de semáforo de acesso a tabela de arquivos globais
+std::mutex acesso_tabela; 
 std::map<std::string, EstadoLocal> meus_arquivos_estados;
-rpc::client tracker("186.217.124.198", 8000); // bind do peer tracker
+rpc::client tracker("192.168.1.20", 8000); 
 
-// função adiquirida por IA para obtenção do IP do peer por meio de comunicação ao servidor do google
+// === NOVAS VARIÁVEIS DE PROTEÇÃO DO VIGIA ===
+std::mutex verifica_download;
+bool esta_em_download = false;
+
+
+// ========================================================
+// 0. PERSISTÊNCIA DE DADOS LOCAIS (JSON)
+// ========================================================
+
+void salvar_estado_local() {
+    std::lock_guard<std::mutex> lock(acesso_tabela); 
+    json j;
+    
+    for (const auto& [nome, estado] : meus_arquivos_estados) {
+        j[nome] = {
+            {"versao", estado.versao},
+            {"permissao", estado.permissao},
+            {"tamanho_bytes", estado.tamanho_bytes},
+            {"ultima_modificacao", estado.ultima_modificacao.time_since_epoch().count()}
+        };
+    }
+    
+    std::string arquivo_estado = "estado_cliente_" + meu_usuario + ".json";
+    std::ofstream file(arquivo_estado);
+    if (file.is_open()) {
+        file << j.dump(4);
+    }
+}
+
+void carregar_estado_local() {
+    std::string arquivo_estado = "estado_cliente_" + meu_usuario + ".json";
+    std::ifstream file(arquivo_estado);
+    
+    if (file.is_open()) {
+        json j;
+        file >> j;
+        
+        std::lock_guard<std::mutex> lock(acesso_tabela);
+        for (auto& el : j.items()) {
+            EstadoLocal est;
+            est.versao = el.value()["versao"];
+            est.permissao = el.value()["permissao"];
+            
+            if (el.value().contains("tamanho_bytes")) {
+                est.tamanho_bytes = el.value()["tamanho_bytes"];
+            } else {
+                est.tamanho_bytes = 0;
+            }
+            
+            long long ticks = el.value()["ultima_modificacao"];
+            est.ultima_modificacao = std::filesystem::file_time_type(std::filesystem::file_time_type::duration(ticks));
+            
+            meus_arquivos_estados[el.key()] = est;
+        }
+        std::cout << "[SISTEMA] Estado local recuperado. " << meus_arquivos_estados.size() << " arquivos na memoria.\n";
+    }
+}
+
+// ========================================================
+// BENCHMARK: OUVINTE UDP E FILTRO
+// ========================================================
+void servidor_udp_ping(int porta_rpc_base) {
+    int porta_udp = porta_rpc_base + 10000;
+    int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sockfd < 0) return;
+
+    sockaddr_in server_addr{};
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_addr.s_addr = INADDR_ANY;
+    server_addr.sin_port = htons(porta_udp);
+    
+    bind(sockfd, (const struct sockaddr *)&server_addr, sizeof(server_addr));
+
+    char buffer[10];
+    sockaddr_in client_addr;
+    socklen_t len = sizeof(client_addr);
+    
+    while(true) {
+        int n = recvfrom(sockfd, (char *)buffer, 10, MSG_WAITALL, (struct sockaddr *) &client_addr, &len);
+        if (n > 0) {
+            buffer[n] = '\0';
+            if (strcmp(buffer, "PING") == 0) {
+                sendto(sockfd, "PONG", 4, MSG_CONFIRM, (const struct sockaddr *) &client_addr, len);
+            }
+        }
+    }
+}
+
+using Endereco = std::pair<std::string, int>;
+
+std::vector<Endereco> filtrar_peers_por_latencia(const std::vector<Endereco>& peers, int timeout_ms) {
+    std::vector<Endereco> peers_aprovados;
+    int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sockfd < 0) return peers_aprovados;
+
+    struct timeval tv;
+    tv.tv_sec = timeout_ms / 1000;
+    tv.tv_usec = (timeout_ms % 1000) * 1000;
+    setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    for (const auto& peer : peers) {
+        std::string ip = peer.first;
+        int porta_rpc = peer.second;
+        int porta_udp = porta_rpc + 10000;
+
+        sockaddr_in servaddr{};
+        servaddr.sin_family = AF_INET;
+        servaddr.sin_port = htons(porta_udp);
+        inet_pton(AF_INET, ip.c_str(), &servaddr.sin_addr);
+
+        auto inicio = std::chrono::high_resolution_clock::now();
+        sendto(sockfd, "PING", 4, MSG_CONFIRM, (const struct sockaddr *) &servaddr, sizeof(servaddr));
+
+        char buffer[10];
+        socklen_t len = sizeof(servaddr);
+        int n = recvfrom(sockfd, (char *)buffer, 10, MSG_WAITALL, (struct sockaddr *) &servaddr, &len);
+        auto fim = std::chrono::high_resolution_clock::now();
+
+        if (n > 0) {
+            buffer[n] = '\0';
+            if (strcmp(buffer, "PONG") == 0) {
+                auto latencia = std::chrono::duration_cast<std::chrono::milliseconds>(fim - inicio).count();
+                std::cout << "[UDP-PING] Peer " << ip << ":" << porta_rpc << " respondeu em " << latencia << "ms.\n";
+                if (latencia <= timeout_ms) {
+                    peers_aprovados.push_back(peer);
+                }
+            }
+        } else {
+            std::cout << "[UDP-PING] Timeout/Falha no Peer " << ip << ":" << porta_rpc << " (>" << timeout_ms << "ms).\n";
+        }
+    }
+    close(sockfd);
+    return peers_aprovados;
+}
+
+// ========================================================
+// 1. DESCOBERTA DE REDE (IP DINÂMICO)
+// ========================================================
 std::string obter_meu_ip() {
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (sock < 0) return "127.0.0.1";
@@ -59,7 +206,6 @@ std::string obter_meu_ip() {
     serv.sin_addr.s_addr = inet_addr("8.8.8.8"); 
     serv.sin_port = htons(53);
 
-    // connect num socket UDP não envia dados, só resolve a rota
     int err = connect(sock, (const struct sockaddr*)&serv, sizeof(serv));
     if (err < 0) {
         close(sock);
@@ -81,46 +227,168 @@ std::string obter_meu_ip() {
     return ip_descoberto;
 }
 
-//função que faz o download de acordo com os pares de ip e porta devolvida pelo servidor tracker, futuramente adicionar lógica de partição de arquivo para fazer o download de várias fontes
-void fazer_download(std::string nome_arq, rpc::client& tracker_ativo) {
+// ========================================================
+// 2. LÓGICA DE DOWNLOAD
+// ========================================================
+int fazer_download(std::string nome_arq, rpc::client& tracker_ativo) {
+    verifica_download.lock();
+    esta_em_download = true;
+    verifica_download.unlock();
+
     std::string caminho_completo = meu_diretorio + "/" + nome_arq;
     
-    using Endereco = std::pair<std::string, int>;
-    auto enderecos = tracker_ativo.call("buscar_peers", meu_usuario, nome_arq).as<std::vector<Endereco>>();
-
-    if (!enderecos.empty()) {
-        std::string ip_alvo = enderecos[0].first;
-        int porta_alvo = enderecos[0].second; 
-        
-        std::cout << "[PEER] Baixando atualizacao de " << ip_alvo << ":" << porta_alvo << "...\n";
-        
-        try {
-            rpc::client outro_peer(ip_alvo, porta_alvo);
-            auto dados_arquivo = outro_peer.call("transferir_arquivo", nome_arq).as<std::vector<char>>();
-            
-            std::ofstream arquivo_saida(caminho_completo, std::ios::binary); 
-            if (arquivo_saida.is_open()) {
-                arquivo_saida.write(dados_arquivo.data(), dados_arquivo.size());
-                arquivo_saida.close();
-                
-                std::cout << "[PEER] Download de '" << nome_arq << "' concluido fisicamente!\n";
-
-                tracker_ativo.call("registrar_peer", meu_usuario, nome_arq,NULL, download);
-            }
-        } catch (const std::exception& e) {
-            std::cout << "[ERRO] Falha ao conectar no Peer.\n";
-        }
-    } else {
-         std::cout << "[PEER] O dono do arquivo esta offline. Download pendente.\n";
+    auto enderecos_brutos = tracker_ativo.call("buscar_peers", meu_usuario, nome_arq).as<std::vector<Endereco>>();
+    if (enderecos_brutos.empty()) {
+        std::cout << "[PEER] O dono do arquivo esta offline.\n";
+        verifica_download.lock(); esta_em_download = false; verifica_download.unlock();
+        return 0;
     }
+
+    auto enderecos = enderecos_brutos; 
+    if (enderecos.empty()) {
+        verifica_download.lock(); esta_em_download = false; verifica_download.unlock();
+        return 0;
+    }
+
+    int tamanho_total = tracker_ativo.call("obter_tamanho_arquivo", nome_arq).as<int>();
+    if (tamanho_total <= 0) {
+        std::cout << "[ERRO] Tamanho do arquivo indisponivel no servidor.\n";
+        verifica_download.lock(); esta_em_download = false; verifica_download.unlock();
+        return 0;
+    }
+
+    int num_paginas = (tamanho_total + PAGINA - 1) / PAGINA; 
+    
+    std::cout << "[PEER] Iniciando download de '" << nome_arq << "' (" << tamanho_total << " bytes em " << num_paginas << " paginas)...\n";
+
+    std::map<std::string, int> estatisticas_download;
+    std::mutex trava_estatisticas; 
+    
+    std::cout << "\n[TELEMETRIA] Peers disponiveis para esta transferencia:\n";
+    for (const auto& peer : enderecos) {
+        std::string chave_peer = peer.first + ":" + std::to_string(peer.second);
+        estatisticas_download[chave_peer] = 0;
+        std::cout << " -> " << chave_peer << "\n";
+    }
+    std::cout << "\n";
+
+    {
+        std::ofstream arquivo_criar(caminho_completo, std::ios::binary);
+        arquivo_criar.close(); 
+        std::filesystem::resize_file(caminho_completo, tamanho_total); 
+    }
+
+    std::vector<std::thread> threads_download;
+    std::mutex trava_escrita_arquivo; 
+    const int MAX_THREADS_SIMULTANEAS = 10; 
+    
+    // Flag global para avisar todas as threads caso uma página não seja encontrada em NENHUM peer
+    std::atomic<bool> falha_critica(false);
+
+    for (int i = 0; i < num_paginas; i++) {
+        threads_download.push_back(std::thread([&, i]() {
+            if (falha_critica) return; // Se outra thread já acusou falha irrecuperável, aborta a execução
+
+            bool sucesso = false;
+            std::string peer_usado = "";
+
+            // === LÓGICA DE FALLBACK ===
+            // Tenta baixar a página i de cada peer da lista, começando do índice 0
+            for (size_t p = 0; p < enderecos.size(); ++p) {
+                Endereco peer_alvo = enderecos[p];
+                std::string chave_peer = peer_alvo.first + ":" + std::to_string(peer_alvo.second);
+
+                try {
+                    rpc::client outro_peer(peer_alvo.first, peer_alvo.second);
+                    auto dados_pagina = outro_peer.call("transferir_pagina", nome_arq, i).as<std::vector<char>>();
+
+                    if (dados_pagina.empty()) {
+                        continue; // O peer não retornou dados (pode estar com arquivo corrompido), tenta o próximo!
+                    }
+
+                    std::lock_guard<std::mutex> lock(trava_escrita_arquivo);
+                    std::fstream arquivo_saida(caminho_completo, std::ios::binary | std::ios::in | std::ios::out);
+                    arquivo_saida.seekp(i * PAGINA, std::ios::beg);
+                    arquivo_saida.write(dados_pagina.data(), dados_pagina.size());
+                    
+                    sucesso = true; 
+                    peer_usado = chave_peer;
+                    break; // SUCESSO! Quebra o laço de tentativas, não precisa pedir para os outros peers.
+                } catch (...) {
+                    // Erro de TCP com este peer. Continua silenciosamente o laço para tentar o próximo peer disponível.
+                }
+            }
+
+            if (sucesso) {
+                std::lock_guard<std::mutex> lock_stats(trava_estatisticas);
+                estatisticas_download[peer_usado]++;
+            } else {
+                std::cout << "[ERRO] Todos os peers falharam ao fornecer a pagina " << i << ".\n";
+                falha_critica = true; // Aciona o gatilho de aborto para o programa inteiro
+            }
+        }));
+
+        if (threads_download.size() >= MAX_THREADS_SIMULTANEAS) {
+            for (auto& t : threads_download) {
+                if (t.joinable()) t.join();
+            }
+            threads_download.clear(); 
+        }
+    }
+
+    for (auto& t : threads_download) {
+        if (t.joinable()) t.join();
+    }
+
+    // === VERIFICA SE HOUVE FALHA CRÍTICA ===
+    if (falha_critica) {
+        std::cout << "\n[FALHA FATAL] O download nao poude ser concluido. Removendo arquivo corrompido do disco...\n";
+        std::filesystem::remove(caminho_completo); // Exclui o arquivo quebrado
+
+        verifica_download.lock();
+        esta_em_download = false;
+        verifica_download.unlock();
+
+        return 0; // Retorna falha
+    }
+
+    std::cout << "\n=========================================\n";
+    std::cout << "          RELATORIO DE DOWNLOAD          \n";
+    std::cout << "=========================================\n";
+    for (const auto& [peer, paginas_baixadas] : estatisticas_download) {
+        if (paginas_baixadas > 0) { // Mostra apenas os peers que realmente ajudaram
+            double porcentagem = ((double)paginas_baixadas / num_paginas) * 100.0;
+            std::cout << "[+] " << peer << " forneceu " << paginas_baixadas << " paginas (";
+            printf("%.1f%%", porcentagem); 
+            std::cout << " do arquivo)\n";
+        }
+    }
+    std::cout << "=========================================\n\n";
+
+    int tamanho_baixado = (int)std::filesystem::file_size(caminho_completo);
+    tracker_ativo.call("registrar_peer", meu_usuario, nome_arq, (int)somente_leitura, (int)download, (int)tamanho_baixado);
+
+    acesso_tabela.lock();
+    int versao = tracker_ativo.call("verificar_versao", meu_usuario, nome_arq).as<int>();
+    meus_arquivos_estados[nome_arq] = {versao, std::filesystem::last_write_time(caminho_completo), somente_leitura, tamanho_baixado};
+    acesso_tabela.unlock();
+
+    verifica_download.lock();
+    esta_em_download = false;
+    verifica_download.unlock();
+
+    salvar_estado_local();
+
+    return 1;
 }
 
-//função de sincronização automática dos arquivos baixados e compartilhados, também realiza a verificação de ip para que o código também permita a mobilidade e transição do computador com mudanças de IP no meio do programa
+// ========================================================
+// 3. O VIGIA (THREAD DE BACKGROUND)
+// ========================================================
 void sincronizador_automatico() {
-   
     while (true) {
-        // a função roda sempre a cada 5 segundos
         std::this_thread::sleep_for(std::chrono::seconds(5));
+        bool precisa_salvar_json = false; 
 
         try {
             std::string ip_verificado = obter_meu_ip();
@@ -130,28 +398,37 @@ void sincronizador_automatico() {
             }
         } catch (...) {}
 
-        //passa por todos arquivos pertencentes ao diretório do atual usuário logado
         for (const auto& entrada : fs::directory_iterator(meu_diretorio)) {
             if (entrada.is_regular_file()) {
                 std::string nome_arq = entrada.path().filename().string();
 
-                //elimina tipos de arquivos especiais no qual podem ser gerados
                 if (nome_arq.front() == '.' || nome_arq.back() == '~') {
                     continue; 
                 }
 
-                //obtem o tempo atual do arquivo através do seu metadado
-                auto tempo_atual = std::filesystem::last_write_time(entrada.path());
+                // === A MÁGICA ACONTECE AQUI: IGNORA O QUE ESTÁ SENDO BAIXADO ===
+                bool arquivo_sendo_baixado = false;
+                {
+                    verifica_download.lock();
+                    if (esta_em_download == true) {
+                        arquivo_sendo_baixado = true;
+                    }
+                    verifica_download.unlock();
+                }
+                if (arquivo_sendo_baixado) {
+                    continue; // Pula a análise desse arquivo completamente
+                }
 
-                
+                auto tempo_atual = std::filesystem::last_write_time(entrada.path());
+                int tamanho_fisico = (int)std::filesystem::file_size(entrada.path());
+
                 bool arquivo_adicionado = false;
                 bool foi_modificado = false;
                 bool verificar_rede = false;
                 int versao_local = 0;
 
-                { // pede acesso para fazer leituras na tabela de dados e realiza todas as operações
+                { 
                     std::lock_guard<std::mutex> lock_leitura(acesso_tabela);
-                    
                     if (meus_arquivos_estados.find(nome_arq) == meus_arquivos_estados.end()) {
                         arquivo_adicionado = true;
                     } else if (tempo_atual > meus_arquivos_estados[nome_arq].ultima_modificacao) {
@@ -160,82 +437,79 @@ void sincronizador_automatico() {
                         verificar_rede = true;
                         versao_local = meus_arquivos_estados[nome_arq].versao;
                     }
-                } // Aqui o lock_leitura morre e a tabela fica livre
+                } 
 
-                //ações que podem ser tomadas de acordo com as verificações realizadas acima
                 try {
                     if (arquivo_adicionado) {
                         std::cout << "\n[AUTO-SYNC] Novo arquivo detectado localmente: " << nome_arq << "\n";
-                        int nova_v = tracker.call("registrar_peer", meu_usuario, nome_arq, privado, upload).as<int>();
+                        int nova_v = tracker.call("registrar_peer", meu_usuario, nome_arq, privado, upload, tamanho_fisico).as<int>();
                         
-                        //escrita rápida
                         std::lock_guard<std::mutex> lock_escrita(acesso_tabela);
-                        meus_arquivos_estados[nome_arq] = {nova_v, tempo_atual, privado};
+                        meus_arquivos_estados[nome_arq] = {nova_v, tempo_atual, privado, tamanho_fisico};
+                        precisa_salvar_json = true;
                     } 
                     else if (foi_modificado) {
                         std::cout << "\n[AUTO-SYNC] Mudanca local em " << nome_arq << " detectada!\n";
-                        int nova_v = tracker.call("atualizar_arquivo", meu_usuario, nome_arq).as<int>();
+                        int nova_v = tracker.call("atualizar_arquivo", meu_usuario, nome_arq, tamanho_fisico).as<int>();
                         
                         if (nova_v == -2) {
                             std::cout << "[AUTO-SYNC] BLOQUEADO: Arquivo somente leitura ou privado!\n";
-                            fazer_download(nome_arq, tracker);
-                            
-                            //o arquivo coloca o tempo atual como o estado mais atual do arquivo mesmo sendo o mesmo
-                            std::lock_guard<std::mutex> lock_escrita(acesso_tabela);
-                            meus_arquivos_estados[nome_arq].ultima_modificacao = std::filesystem::last_write_time(entrada.path());
+                            // A chamada abaixo já cuida de atualizar a memória quando o download acaba
+                            fazer_download(nome_arq, tracker); 
                         } else {
                             std::lock_guard<std::mutex> lock_escrita(acesso_tabela);
                             meus_arquivos_estados[nome_arq].versao = nova_v;
                             meus_arquivos_estados[nome_arq].ultima_modificacao = tempo_atual;
+                            meus_arquivos_estados[nome_arq].tamanho_bytes = tamanho_fisico; 
                         }
-                    } 
+                        precisa_salvar_json = true;
+                    }
                     else if (verificar_rede) {
                         int versao_rede = tracker.call("verificar_versao", meu_usuario, nome_arq).as<int>();
                         
                         if (versao_rede > versao_local) {
                             std::cout << "\n[AUTO-SYNC] Baixando versao atualizada (v" << versao_rede << ") de " << nome_arq << "...\n";
+                            // A chamada abaixo já cuida de atualizar a memória quando o download acaba
                             fazer_download(nome_arq, tracker); 
-
-                            auto nova_data_fisica = std::filesystem::last_write_time(entrada.path());
-                            
-                            std::lock_guard<std::mutex> lock_escrita(acesso_tabela);
-                            meus_arquivos_estados[nome_arq].versao = versao_rede;
-                            meus_arquivos_estados[nome_arq].ultima_modificacao = nova_data_fisica;
                         }
                     }
-                } catch (const std::exception& e) {
-                    // Ignora falhas de conexão momentâneas
-                }
+                } catch (const std::exception& e) {}
             }
+        }
+        
+        if (precisa_salvar_json) {
+            salvar_estado_local();
         }
     }
 }
 
-// Função que recebe a requisição de outros nós e transferem os dados para o nó requirinte
-std::vector<char> transferir_arquivo(std::string nome_arquivo) {
-    //obtem o endereço até o arquivo requirido
+// ========================================================
+// 4. SERVIDOR DO CLIENTE & FUNÇÕES DO MENU
+// ========================================================
+std::vector<char> transferir_pagina(std::string nome_arquivo, int indice_pagina) {
     std::string caminho_completo = meu_diretorio + "/" + nome_arquivo;
-    std::cout << "[PEER SERVIDOR] Pedido de download recebido para: " << nome_arquivo << "\n";
+    std::ifstream arquivo(caminho_completo, std::ios::binary);
+    
+    if (!arquivo.is_open()) return std::vector<char>();
 
-    //ponteiro do arquivo
-    std::ifstream arquivo(caminho_completo, std::ios::binary | std::ios::ate);
-    if (!arquivo.is_open()) return std::vector<char>(); // se arquivo não abriu retorna sem conteúdo
+    arquivo.seekg(0, std::ios::end);
+    std::streamsize tamanho_total = arquivo.tellg();
+    
+    std::streamsize offset = indice_pagina * PAGINA;
+    std::streamsize bytes_restantes = tamanho_total - offset;
+    std::streamsize tamanho_leitura = std::min((std::streamsize)PAGINA, bytes_restantes);
 
-    //obtem o tamanho do conteúdo contido no arquivo
-    std::streamsize tamanho = arquivo.tellg();
-    arquivo.seekg(0, std::ios::beg);
-    std::vector<char> buffer(tamanho);
+    if (tamanho_leitura <= 0) return std::vector<char>(); 
 
-    // faz a leitura de dados
-    if (arquivo.read(buffer.data(), tamanho)) {
+    arquivo.seekg(offset, std::ios::beg);
+    std::vector<char> buffer(tamanho_leitura);
+    
+    if (arquivo.read(buffer.data(), tamanho_leitura)) {
         return buffer;
     }
-
-    //retorna os dados lidos
     return std::vector<char>();
 }
 
-// menu de cadastramento de arquivos, futuramente será um modificador de permissão de arquivo ou exlusão
 void cadastra_obj() {
     std::string arquivo;
     int permissao;
@@ -256,16 +530,18 @@ void cadastra_obj() {
     
     permissao += 3;
 
-    std::cout << "%d" << permissao;
+    int tamanho = (int)std::filesystem::file_size(caminho_completo);
 
-    int estado = tracker.call("registrar_peer", meu_usuario, arquivo, permissao, upload).as<int>();
+    int estado = tracker.call("registrar_peer", meu_usuario, arquivo, (int)permissao, (int)upload, (int)tamanho).as<int>();
     
     if (estado == 1) {
-        std::lock_guard<std::mutex> lock_escrita(acesso_tabela);
         std::cout << "Arquivo registrado com sucesso!\n";
-        
+        acesso_tabela.lock();
         auto tempo_mod = std::filesystem::last_write_time(caminho_completo);
-        meus_arquivos_estados[arquivo] = {1, tempo_mod, permissao};
+        meus_arquivos_estados[arquivo] = {1, tempo_mod, permissao, tamanho}; 
+        acesso_tabela.unlock(); 
+       
+        salvar_estado_local();
     }
 }
 
@@ -281,15 +557,16 @@ void aquisicao_obj() {
     }
 
     std::cout << "Buscando o arquivo " << arquivo_requirido << " no servidor...\n";
-    fazer_download(arquivo_requirido, tracker); 
+    if(fazer_download(arquivo_requirido, tracker) == 0){
+        std::cout << "O download do arquivo requirido falhou\n";
+        return;
+    } 
 }
 
-// Menu de criação de arquivos e setador de permissões
 void criar_arquivo_txt() {
     std::string nome_arquivo, conteudo;
     int permissao;
 
-    // Obtenho todos os dados do arquivo para depois cria-lo, faço isso por condição de corrida ocorrida pelo sincronizador de arquivos, no qual antes dessa mudança as permições eram setadas por aquela função ao invés do usuário
     std::cout << "Nome do arquivo (ex: teste.txt): ";
     std::cin >> nome_arquivo;
 
@@ -305,25 +582,27 @@ void criar_arquivo_txt() {
         std::cin >> permissao;
     } while (permissao < 0 || permissao > 2);
         
-        permissao += 3;
+    permissao += 3;
 
-        if (tracker.call("registrar_peer", meu_usuario, nome_arquivo, permissao, upload).as<int>() == 1) {
+    std::ofstream arquivo(caminho_completo); 
+    if(arquivo.is_open()){
+        arquivo << conteudo; 
+        arquivo.close();
+        std::cout << "[SISTEMA] Arquivo criado no disco!\n";
+        
+        int tamanho = (int)std::filesystem::file_size(caminho_completo);
+
+        if (tracker.call("registrar_peer", meu_usuario, nome_arquivo, (int)permissao, (int)upload, (int)tamanho).as<int>() == 1) {
             std::cout << "[TRACKER] Arquivo registrado na rede!\n";
             
-            // Adiciona no mapa local com segurança
             std::lock_guard<std::mutex> lock_escrita(acesso_tabela);
-            std::ofstream arquivo(caminho_completo); 
-            if(arquivo.is_open()){
-                arquivo << conteudo; 
-                arquivo.close();
-                std::cout << "[SISTEMA] Arquivo criado no disco!\n";
-                
-                meus_arquivos_estados[nome_arquivo] = {1, std::filesystem::last_write_time(caminho_completo), permissao};
-            }
+            meus_arquivos_estados[nome_arquivo] = {1, std::filesystem::last_write_time(caminho_completo), permissao, tamanho};
         }
- }
+        
+        salvar_estado_local();
+    }
+}
 
-// Função que gera um arquivo base de testes, futuramente será removido
 void criar_arquivo_aleatorio(std::string nome_arquivo) {
     std::string caminho_completo = meu_diretorio + "/" + nome_arquivo;
     std::ofstream arquivo(caminho_completo);
@@ -334,7 +613,6 @@ void criar_arquivo_aleatorio(std::string nome_arquivo) {
     }
 }
 
-// função que realiza a leitura inicial do sistema de arquivos com base no usuário, realiza a leitura dos arquivos da pasta do usuário atual ou cria uma nova pasta se o usuário nunca acessou pelo computador. Modificações de instalação de arquivos nos quais pertencem ao usuário mas não estão no computador atual pode ser uma boa implementação
 void inicializar_sistema_de_arquivos() {
     meu_diretorio = "./pasta_" + meu_usuario;
 
@@ -343,24 +621,51 @@ void inicializar_sistema_de_arquivos() {
         criar_arquivo_aleatorio("boas_vindas.txt");
     } 
 
+    carregar_estado_local();
+
     std::cout << "[SISTEMA] Sincronizando arquivos locais...\n";
+    bool encontrou_arquivos_novos = false;
+
     for (const auto& entrada : fs::directory_iterator(meu_diretorio)) {
         if (entrada.is_regular_file()) { 
 
             std::string nome_arq = entrada.path().filename().string();
             
             if (nome_arq.front() == '.' || nome_arq.back() == '~') {
-                continue; // Pula este arquivo e vai para o próximo do loop
+                continue; 
             }
 
-            tracker.call("registrar_peer", meu_usuario, nome_arq, escrita, upload).as<int>();
-            int versao = tracker.call("verificar_versao",meu_usuario,nome_arq).as<int>();
+            int permissao_usada = privado; 
+            int tamanho = (int)std::filesystem::file_size(entrada.path()); 
+            
+            acesso_tabela.lock();
+            bool conhecido = (meus_arquivos_estados.find(nome_arq) != meus_arquivos_estados.end());
+            if (conhecido) {
+                permissao_usada = meus_arquivos_estados[nome_arq].permissao;
+            }
+            acesso_tabela.unlock();
+            
+            tracker.call("registrar_peer", meu_usuario, nome_arq, (int)permissao_usada, (int)upload, (int)tamanho).as<int>();
+            int versao = tracker.call("verificar_versao", meu_usuario, nome_arq).as<int>();
             auto tempo_mod = std::filesystem::last_write_time(entrada.path());
-            meus_arquivos_estados[nome_arq] = {versao, tempo_mod, privado}; 
-            std::cout << " -> [" << nome_arq << "] monitorado.\n";
+            
+            acesso_tabela.lock();
+            meus_arquivos_estados[nome_arq] = {versao, tempo_mod, permissao_usada, tamanho}; 
+            acesso_tabela.unlock();
+
+            if (!conhecido) encontrou_arquivos_novos = true;
+            std::cout << " -> [" << nome_arq << "] monitorado (Tamanho: " << tamanho << "b).\n";
         }
     }
+    
+    if (encontrou_arquivos_novos) {
+        salvar_estado_local();
+    }
 }
+
+// ========================================================
+// 5. MAIN (INICIALIZAÇÃO)
+// ========================================================
 
 int main(int argc, char *argv[]) {
     if (argc < 3) {
@@ -370,22 +675,24 @@ int main(int argc, char *argv[]) {
     
     minha_porta = std::stoi(argv[1]);
     meu_usuario = argv[2]; 
-    meu_ip_atual = obter_meu_ip(); // Descobre o IP real nativamente
+    meu_ip_atual = obter_meu_ip(); 
 
     std::cout << "[SISTEMA] Inicializando com IP Local: " << meu_ip_atual << "\n";
 
-    // Informa ao servidor o nome, IP real e porta
     tracker.call("registrar_usuario_rede", meu_usuario, meu_ip_atual, minha_porta);
 
     inicializar_sistema_de_arquivos();
 
-    // configuração de execução assincrona da única porta de recepção de dados do peer cliente, futuras implementações podem exigir porta fixa por conta do uso de mais de uma porta para a verificação de peers mais recomendados para fazer o download
     rpc::server srv(minha_porta);
-    srv.bind("transferir_arquivo", &transferir_arquivo);
+    srv.bind("transferir_pagina", &transferir_pagina);
     srv.async_run(1); 
     std::cout << "[PEER] Escutando pedidos na porta " << minha_porta << "...\n";
 
-    std::thread thread_sync(sincronizador_automatico); // cria uma thread para o sincronizador rodar em paralelo com o sistema do usuário sem atrapalhar a sua experiência
+    std::thread thread_udp(servidor_udp_ping, minha_porta);
+    thread_udp.detach();
+    std::cout << "[PEER] Escutando pings UDP na porta " << (minha_porta + 10000) << "...\n";
+
+    std::thread thread_sync(sincronizador_automatico); 
     thread_sync.detach(); 
 
     int op = 0; 

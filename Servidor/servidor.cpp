@@ -51,7 +51,7 @@ std::shared_mutex mtx_usuarios;
 
 // Função chamada pelo Cliente logo ao abrir o terminal
 void registrar_usuario_rede(std::string nome, std::string ip, int porta) {
-    std::shared_lock<std::shared_mutex> lock_escrita(mtx_usuarios); // Tranca antes de mexer
+    std::unique_lock<std::shared_mutex> lock_escrita(mtx_usuarios); // Tranca antes de mexer
     
     // Cadastra já com status_vivo = 1
     tabela_usuarios_conectados[nome] = {nome, ip, porta, 1};
@@ -124,7 +124,7 @@ void carregar_estado() {
     }
 }
 
-int atualizar_arquivo(std::string nome_usuario, std::string arquivo) {
+int atualizar_arquivo(std::string nome_usuario, std::string arquivo,int tamanho) {
     if (tabela_arquivos.find(arquivo) != tabela_arquivos.end()) {
         auto& meta = tabela_arquivos[arquivo];
         
@@ -137,6 +137,7 @@ int atualizar_arquivo(std::string nome_usuario, std::string arquivo) {
         meta.versao += 1; 
         meta.usuarios_seeders.clear(); 
         meta.usuarios_seeders.push_back(nome_usuario);
+        meta.tamanho_bytes = tamanho;
         
         std::cout << "[TRACKER] " << nome_usuario << " ATUALIZOU '" << arquivo << "' para v" << meta.versao << ".\n";
         salvar_estado(); 
@@ -161,23 +162,27 @@ int verificar_versao(std::string nome_usuario, std::string arquivo) {
     return 0; 
 }
 
-int registrar_peer(std::string nome_usuario, std::string arquivo,int permisao, int op) {
+int registrar_peer(std::string nome_usuario, std::string arquivo,int permisao, int op,int tamanho) {
     if (tabela_arquivos.find(arquivo) == tabela_arquivos.end()) {
         if (op == upload) {
             MetadadosArquivo meta;
             meta.criador = nome_usuario; // O usuário vira o dono soberano
             meta.tamanho_bytes = 0; 
-            meta.versao = 1;  
+            meta.versao = 1;
+            meta.tamanho_bytes = tamanho;  
             meta.permisao = permisao;      
             meta.usuarios_seeders.push_back(nome_usuario);
             
             tabela_arquivos[arquivo] = meta;
             std::cout << "[TRACKER] Novo arquivo '" << arquivo << "' registrado por " << nome_usuario << ".\n";
         } else {
-            return -1; 
+            return -1;
         }
     } 
-    else {
+    else if(tabela_arquivos[arquivo].criador == nome_usuario){
+        tabela_arquivos[arquivo].permisao = permisao;
+    }
+    else{
         auto& seeders = tabela_arquivos[arquivo].usuarios_seeders;
         if (std::find(seeders.begin(), seeders.end(), nome_usuario) == seeders.end()) {
             seeders.push_back(nome_usuario);
@@ -242,6 +247,13 @@ void limpador_de_peers_inativos() {
     }
 }
 
+int obter_tamanho_arquivo(std::string arquivo) {
+    if (tabela_arquivos.find(arquivo) != tabela_arquivos.end()) {
+        return tabela_arquivos[arquivo].tamanho_bytes;
+    }
+    return 0;
+}
+
 int main() {
     rpc::server srv(8000); 
     carregar_estado();
@@ -257,6 +269,7 @@ int main() {
     srv.bind("atualizar_arquivo", &atualizar_arquivo); 
     srv.bind("verificar_versao", &verificar_versao);
     srv.bind("atualizar_ip_usuario",&atualizar_ip_usuario);
+    srv.bind("obter_tamanho_arquivo",&obter_tamanho_arquivo);
     std::cout << "[TRACKER] Iniciando sistema de Heartbeat...\n";
     //lançamento da thread paralela
     std::thread thread_heartbeat(limpador_de_peers_inativos);
