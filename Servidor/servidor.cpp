@@ -94,11 +94,13 @@ std::string obter_meu_ip() {
 // Função para o Tracker atualizar o IP caso o notebook do cliente mude de rede
 int atualizar_ip_usuario(std::string nome, std::string novo_ip) {
     std::lock_guard<std::shared_mutex> lock_escrita(mtx_usuarios);
+
     if (tabela_usuarios_conectados.count(nome)) {
         tabela_usuarios_conectados[nome].ip = novo_ip;
         std::cout << "[TRACKER] Usuario " << nome << " mudou de rede. Novo IP: " << novo_ip << "\n";
         return 1;
     }
+
     return 0;
 }
 
@@ -148,14 +150,6 @@ int atualizar_arquivo(std::string nome_usuario, std::string arquivo,int tamanho)
 
 int verificar_versao(std::string nome_usuario, std::string arquivo) {
     
-    { // Escopo para o lock_guard não travar tudo à toa
-        std::lock_guard<std::shared_mutex> lock_escrita(mtx_usuarios);
-        // Se o usuário existe, atualiza o status de vida dele para 1
-        if (tabela_usuarios_conectados.count(nome_usuario)) {
-            tabela_usuarios_conectados[nome_usuario].status_vivo = 1;
-        }
-    }
-
     if (tabela_arquivos.find(arquivo) != tabela_arquivos.end()) {
         return tabela_arquivos[arquivo].versao;
     }
@@ -221,6 +215,21 @@ std::vector<std::pair<std::string, int>> buscar_peers(std::string nome_usuario, 
     return enderecos_disponiveis;
 }
 
+void heartbeat(std::string nome, std::string ip, int porta){
+
+    mtx_usuarios.lock();
+    if (tabela_usuarios_conectados.find(nome) != tabela_usuarios_conectados.end())
+    {
+        tabela_usuarios_conectados[nome].status_vivo = 1;
+        mtx_usuarios.unlock();
+    }
+    else{
+        mtx_usuarios.unlock();
+        registrar_usuario_rede(nome,ip,porta);
+    }
+    return;
+}
+
 void limpador_de_peers_inativos() {
     while (true) {
         // Roda o varredor a cada 15 segundos
@@ -270,6 +279,7 @@ int main() {
     srv.bind("verificar_versao", &verificar_versao);
     srv.bind("atualizar_ip_usuario",&atualizar_ip_usuario);
     srv.bind("obter_tamanho_arquivo",&obter_tamanho_arquivo);
+    srv.bind("heartbeat",&heartbeat);
     std::cout << "[TRACKER] Iniciando sistema de Heartbeat...\n";
     //lançamento da thread paralela
     std::thread thread_heartbeat(limpador_de_peers_inativos);
