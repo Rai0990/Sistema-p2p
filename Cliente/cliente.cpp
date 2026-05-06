@@ -54,7 +54,7 @@ std::string meu_ip_atual;
 std::mutex acesso_tabela; 
 std::mutex adiquirir_pagina;
 std::map<std::string, EstadoLocal> meus_arquivos_estados;
-rpc::client tracker("186.217.124.101", 8000); // Endereço e porta do servidor, teria como definir na main, mas teria que ser por ponteiro e toda a estrutura lógica já foi montada sem ser por ponteiro
+rpc::client tracker("192.168.1.20", 8000); // Endereço e porta do servidor, teria como definir na main, mas teria que ser por ponteiro e toda a estrutura lógica já foi montada sem ser por ponteiro
 
 // Variáveis de bloqueio de verificação de arquivos que estão fazendo download
 std::mutex verifica_download;
@@ -222,6 +222,9 @@ std::string obter_meu_ip() {
 // ========================================================
 // 2. LÓGICA DE DOWNLOAD (Com Fila Dinâmica e Fallback Justo)
 // ========================================================
+// ========================================================
+// 2. LÓGICA DE DOWNLOAD (Com Fila Dinâmica e Cronômetro)
+// ========================================================
 int fazer_download(std::string nome_arq, rpc::client& tracker_ativo) {
     verifica_download.lock();
     esta_em_download = true;
@@ -273,30 +276,28 @@ int fazer_download(std::string nome_arq, rpc::client& tracker_ativo) {
     std::mutex trava_escrita_arquivo; 
     bool falha_critica = false;
     
-    // ========================================================
-    // FILA DINÂMICA DE TRABALHO
-    // ========================================================
     std::vector<int> paginas_pendentes;
     for (int i = 0; i < num_paginas; i++) {
         paginas_pendentes.push_back(i);
     }
 
     int rodadas_sem_sucesso = 0;
-    int peer_offset = 0; // Ajuda a rotacionar quem atende qual pedido
+    int peer_offset = 0; 
+
+    // ========================================================
+    // INÍCIO DO CRONÔMETRO
+    // ========================================================
+    auto tempo_inicio = std::chrono::high_resolution_clock::now();
 
     while (!paginas_pendentes.empty()) {
         std::vector<std::thread> lote_threads;
         std::mutex trava_falhas;
         std::vector<int> paginas_com_falha;
 
-        // Regra de Ouro: O lote NUNCA será maior que o número de peers.
-        // Isso garante no máximo 1 requisição TCP simultânea por peer!
         int tamanho_lote = std::min((int)paginas_pendentes.size(), (int)enderecos.size());
 
         for (int i = 0; i < tamanho_lote; i++) {
             int pagina_atual = paginas_pendentes[i];
-            
-            // Pega um peer da lista e gira o carrossel
             Endereco peer_alvo = enderecos[(peer_offset + i) % enderecos.size()];
 
             lote_threads.push_back(std::thread([&, pagina_atual, peer_alvo]() {
@@ -322,43 +323,48 @@ int fazer_download(std::string nome_arq, rpc::client& tracker_ativo) {
                     std::lock_guard<std::mutex> lock_stats(trava_estatisticas);
                     estatisticas_download[chave_peer]++;
                 } else {
-                    // Devolve para a fila de espera se deu erro
                     std::lock_guard<std::mutex> lock_falha(trava_falhas);
                     paginas_com_falha.push_back(pagina_atual);
                 }
             }));
         }
 
-        // Espera todo mundo que foi contatado responder (ou dar timeout)
         for (auto& t : lote_threads) {
             if (t.joinable()) t.join();
         }
 
-        // Avança o carrossel para que na próxima rodada os peers peguem páginas diferentes
         peer_offset = (peer_offset + tamanho_lote) % enderecos.size();
-
-        // Limpa as páginas que já foram tentadas no início da fila
         paginas_pendentes.erase(paginas_pendentes.begin(), paginas_pendentes.begin() + tamanho_lote);
 
-        // Se houveram falhas, joga elas de volta pro FIM da fila para tentar com outro peer
         for (int pag_quebrada : paginas_com_falha) {
             paginas_pendentes.push_back(pag_quebrada);
         }
 
-        // Sistema Anti-Loop Infinito: Se o lote inteiro falhou e não conseguimos baixar NADA
         if (paginas_com_falha.size() == tamanho_lote) {
             rodadas_sem_sucesso++;
-            if (rodadas_sem_sucesso >= 3) { // Desiste após 3 rodadas estéreis consecutivas
+            if (rodadas_sem_sucesso >= 3) { 
                 std::cout << "[ERRO] Multiplos peers falharam. Limite de tentativas excedido.\n";
                 falha_critica = true;
                 break;
             }
         } else {
-            rodadas_sem_sucesso = 0; // Tivemos progresso, zera o alerta
+            rodadas_sem_sucesso = 0; 
         }
     }
 
-    // === VERIFICA SE HOUVE FALHA CRÍTICA ===
+    // ========================================================
+    // FIM DO CRONÔMETRO E CÁLCULO
+    // ========================================================
+    auto tempo_fim = std::chrono::high_resolution_clock::now();
+    long long duracao_ms = std::chrono::duration_cast<std::chrono::milliseconds>(tempo_fim - tempo_inicio).count();
+    
+    // Evita divisão por zero se o download for rápido demais (< 1ms)
+    double segundos_decorridos = std::max(duracao_ms / 1000.0, 0.001); 
+    
+    // Calcula Megabytes e Velocidade
+    double megabytes_total = tamanho_total / (1024.0 * 1024.0);
+    double velocidade_mbps = megabytes_total / segundos_decorridos;
+
     if (falha_critica) {
         std::cout << "\n[FALHA FATAL] O download nao pode ser concluido. Removendo arquivo corrompido do disco...\n";
         std::filesystem::remove(caminho_completo); 
@@ -367,12 +373,21 @@ int fazer_download(std::string nome_arq, rpc::client& tracker_ativo) {
         esta_em_download = false;
         verifica_download.unlock();
 
-        return 0; // Retorna falha
+        return 0; 
     }
 
     std::cout << "\n=========================================\n";
     std::cout << "          RELATORIO DE DOWNLOAD          \n";
     std::cout << "=========================================\n";
+    std::cout << "Tempo total   : " << duracao_ms << " ms (" << segundos_decorridos << " segundos)\n";
+    std::cout << "Velocidade    : ";
+    if (velocidade_mbps >= 1.0) {
+        printf("%.2f MB/s\n", velocidade_mbps);
+    } else {
+        printf("%.2f KB/s\n", velocidade_mbps * 1024.0); // Converte para KB/s se for muito pequeno
+    }
+    std::cout << "-----------------------------------------\n";
+    
     for (const auto& [peer, paginas_baixadas] : estatisticas_download) {
         if (paginas_baixadas > 0) { 
             double porcentagem = ((double)paginas_baixadas / num_paginas) * 100.0;
@@ -384,11 +399,14 @@ int fazer_download(std::string nome_arq, rpc::client& tracker_ativo) {
     std::cout << "=========================================\n\n";
 
     int tamanho_baixado = (int)std::filesystem::file_size(caminho_completo);
-    tracker_ativo.call("registrar_peer", meu_usuario, nome_arq, (int)somente_leitura, (int)download, (int)tamanho_baixado);
+    
+    // Usa a permissão real (Correção que fizemos anteriormente)
+    int permissao_real = tracker_ativo.call("obter_permissao_arquivo", nome_arq).as<int>();
+    tracker_ativo.call("registrar_peer", meu_usuario, nome_arq, permissao_real, (int)download, (int)tamanho_baixado);
 
     acesso_tabela.lock();
     int versao = tracker_ativo.call("verificar_versao", meu_usuario, nome_arq).as<int>();
-    meus_arquivos_estados[nome_arq] = {versao, std::filesystem::last_write_time(caminho_completo), somente_leitura, tamanho_baixado};
+    meus_arquivos_estados[nome_arq] = {versao, std::filesystem::last_write_time(caminho_completo), permissao_real, tamanho_baixado};
     acesso_tabela.unlock();
 
     verifica_download.lock();
@@ -476,9 +494,20 @@ void sincronizador_automatico() {
                     else if (verificar_rede) {
                         int versao_rede = tracker.call("verificar_versao", meu_usuario, nome_arq).as<int>();
                         
-                        if (versao_rede > versao_local) {
+                        if (versao_rede == -1) {
+                            std::cout << "\n[AUTO-SYNC] O arquivo '" << nome_arq << "' foi morto na rede (Lapide). Removendo localmente...\n";
+                            
+                            std::filesystem::remove(entrada.path()); // Exclui do disco
+                            
+                            std::lock_guard<std::mutex> lock_escrita(acesso_tabela);
+                            meus_arquivos_estados.erase(nome_arq); // Exclui do JSON
+                            precisa_salvar_json = true;
+                            
+                            tracker.call("confirmar_remocao_seeder", meu_usuario, nome_arq); 
+                            
+                        }
+                        else if (versao_rede > versao_local) {
                             std::cout << "\n[AUTO-SYNC] Baixando versao atualizada (v" << versao_rede << ") de " << nome_arq << "...\n";
-                            // A chamada abaixo já cuida de atualizar a memória quando o download acaba
                             fazer_download(nome_arq, tracker); 
                         }
                     }
@@ -521,6 +550,39 @@ std::vector<char> transferir_pagina(std::string nome_arquivo, int indice_pagina)
     }
     adiquirir_pagina.unlock();
     return std::vector<char>();
+}
+
+void excluir_obj() {
+    std::string arquivo_requirido;
+    std::cout << "Digite o nome do arquivo que deseja excluir:\n";
+    std::cin >> arquivo_requirido;
+
+    // A chamada RPC para o servidor. O Servidor fará a lógica:
+    // - Se 'meu_usuario' for o dono: muda a versão do arquivo para -1.
+    // - Se 'meu_usuario' NÃO for o dono: apenas remove ele da lista de peers deste arquivo.
+    int status = tracker.call("solicitar_exclusao_arquivo", meu_usuario, arquivo_requirido).as<int>();
+
+    if (status == 1) { // Sucesso na requisição
+        std::cout << "[PEER] Solicitacao de exclusao processada pelo servidor.\n";
+        
+        std::string caminho_completo = meu_diretorio + "/" + arquivo_requirido;
+        
+        // Exclui fisicamente do disco local
+        if (std::filesystem::exists(caminho_completo)) {
+            std::filesystem::remove(caminho_completo);
+        }
+
+        // Limpa da memória local
+        acesso_tabela.lock();
+        if (meus_arquivos_estados.find(arquivo_requirido) != meus_arquivos_estados.end()) {
+            meus_arquivos_estados.erase(arquivo_requirido);
+        }
+        acesso_tabela.unlock();
+        
+        salvar_estado_local();
+    } else {
+        std::cout << "[ERRO] Falha ao excluir. Arquivo nao existe ou erro no servidor.\n";
+    }
 }
 
 void cadastra_obj() {
@@ -636,8 +698,10 @@ void inicializar_sistema_de_arquivos() {
 
     carregar_estado_local();
 
-    std::cout << "[SISTEMA] Sincronizando arquivos locais...\n";
-    bool encontrou_arquivos_novos = false;
+    std::cout << "[SISTEMA] Sincronizando arquivos locais com o Servidor...\n";
+    
+    // Substituimos 'encontrou_arquivos_novos' por esta flag unificada
+    bool precisa_salvar_json = false; 
 
     for (const auto& entrada : fs::directory_iterator(meu_diretorio)) {
         if (entrada.is_regular_file()) { 
@@ -650,32 +714,66 @@ void inicializar_sistema_de_arquivos() {
 
             int permissao_usada = privado; 
             int tamanho = (int)std::filesystem::file_size(entrada.path()); 
+            int versao_json = 0;
             
             acesso_tabela.lock();
             bool conhecido = (meus_arquivos_estados.find(nome_arq) != meus_arquivos_estados.end());
             if (conhecido) {
                 permissao_usada = meus_arquivos_estados[nome_arq].permissao;
+                versao_json = meus_arquivos_estados[nome_arq].versao; // Pega a versão da nossa última sessão
             }
             acesso_tabela.unlock();
-            
-            tracker.call("registrar_peer", meu_usuario, nome_arq, (int)permissao_usada, (int)upload, (int)tamanho).as<int>();
-            int versao = tracker.call("verificar_versao", meu_usuario, nome_arq).as<int>();
-            auto tempo_mod = std::filesystem::last_write_time(entrada.path());
-            
-            acesso_tabela.lock();
-            meus_arquivos_estados[nome_arq] = {versao, tempo_mod, permissao_usada, tamanho}; 
-            acesso_tabela.unlock();
 
-            if (!conhecido) encontrou_arquivos_novos = true;
-            std::cout << " -> [" << nome_arq << "] monitorado (Tamanho: " << tamanho << "b).\n";
+            if (!conhecido) {
+                // Arquivo criado offline
+                tracker.call("registrar_peer", meu_usuario, nome_arq, (int)permissao_usada, (int)upload, (int)tamanho).as<int>();
+                int versao_rede = tracker.call("verificar_versao", meu_usuario, nome_arq).as<int>();
+                auto tempo_mod = std::filesystem::last_write_time(entrada.path());
+                
+                acesso_tabela.lock();
+                meus_arquivos_estados[nome_arq] = {versao_rede, tempo_mod, permissao_usada, tamanho}; 
+                acesso_tabela.unlock();
+                
+                precisa_salvar_json = true;
+                std::cout << " -> [" << nome_arq << "] Novo arquivo monitorado na rede.\n";
+            } else {
+                int versao_rede = tracker.call("verificar_versao", meu_usuario, nome_arq).as<int>();
+                
+                // === LÓGICA DE EXCLUSÃO CORRIGIDA (LAPIDE E GC) ===
+                // Se a rede diz -1 (Lapide Ativa) OU a rede diz 0 mas nós tínhamos o arquivo (Lixo já Coletado)
+                if (versao_rede == -1 || (versao_rede == 0 && versao_json > 0)) {
+                    std::cout << "\n[INIT-SYNC] O arquivo '" << nome_arq << "' foi excluido da rede enquanto voce estava offline. Removendo localmente...\n";
+                            
+                    std::filesystem::remove(entrada.path()); // Exclui do disco
+                            
+                    std::lock_guard<std::mutex> lock_escrita(acesso_tabela);
+                    meus_arquivos_estados.erase(nome_arq); // Exclui do JSON
+                    precisa_salvar_json = true;
+                    
+                    // Só avisa a saída da lista de seeders se a Lapide ainda existir no servidor
+                    if (versao_rede == -1) {
+                        tracker.call("confirmar_remocao_seeder", meu_usuario, nome_arq); 
+                    }
+                }
+                // ====================================================
+                else if (versao_rede > versao_json) {
+                    std::cout << "\n[INIT-SYNC] O arquivo '" << nome_arq << "' foi alterado na rede enquanto voce estava offline!\n";
+                    std::cout << "[INIT-SYNC] Baixando a atualizacao (v" << versao_json << " -> v" << versao_rede << ")...\n";
+                    
+                    // Fazer o download vai atualizar a tabela JSON e a data física
+                    fazer_download(nome_arq, tracker); 
+                } else {
+                    tracker.call("registrar_peer", meu_usuario, nome_arq, (int)permissao_usada, (int)upload, (int)tamanho).as<int>();
+                    std::cout << " -> [" << nome_arq << "] Sincronizado e online (v" << versao_json << ").\n";
+                }
+            }
         }
     }
     
-    if (encontrou_arquivos_novos) {
+    if (precisa_salvar_json) {
         salvar_estado_local();
     }
 }
-
 
 void prova_vida(){
    while (true) {
@@ -733,7 +831,7 @@ int main(int argc, char *argv[]) {
 
     int op = 0; 
     while(op != -1){
-        std::cout << "\n1: Cadastrar arquivo | 2: Baixar arquivo | 3: Criar arquivo | -1: Sair\nEscolha: ";
+        std::cout << "\n1: Cadastrar arquivo | 2: Baixar arquivo | 3: Criar arquivo | 4: Excluir arquivo | -1: Sair\nEscolha: ";
         std::cin >> op;
 
         switch (op) {
@@ -741,6 +839,7 @@ int main(int argc, char *argv[]) {
             case 1: cadastra_obj(); break;
             case 2: aquisicao_obj(); break;
             case 3: criar_arquivo_txt(); break;
+            case 4: excluir_obj(); break;
             default: std::cout << "Opcao invalida.\n"; break;
         }
     }

@@ -30,7 +30,7 @@ struct MetadadosArquivo {
     std::string criador;
     int tamanho_bytes;
     int versao;
-    int permisao;
+    int permissao;
     std::vector<std::string> usuarios_seeders; 
 };
 
@@ -41,7 +41,7 @@ struct Usuario {
     int status_vivo; // 1 = Vivo, 0 = Ausente
 };
 
-NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(MetadadosArquivo, criador, tamanho_bytes, versao, permisao, usuarios_seeders)
+NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(MetadadosArquivo, criador, tamanho_bytes, versao, permissao, usuarios_seeders)
 
 std::map<std::string, MetadadosArquivo> tabela_arquivos;
 std::map<std::string, Usuario> tabela_usuarios_conectados;
@@ -131,7 +131,7 @@ int atualizar_arquivo(std::string nome_usuario, std::string arquivo,int tamanho)
         auto& meta = tabela_arquivos[arquivo];
         
         // Se NÃO é o dono E a permissão NÃO é de escrita pública -> Bloqueia!
-        if (meta.criador != nome_usuario && meta.permisao != escrita) {
+        if (meta.criador != nome_usuario && meta.permissao != escrita) {
             std::cout << "[TRACKER] BLOQUEADO: " << nome_usuario << " tentou modificar '" << arquivo << "' (Dono: " << meta.criador << ")\n";
             return -2; 
         }
@@ -156,7 +156,17 @@ int verificar_versao(std::string nome_usuario, std::string arquivo) {
     return 0; 
 }
 
-int registrar_peer(std::string nome_usuario, std::string arquivo,int permisao, int op,int tamanho) {
+int obter_permissao_arquivo(std::string nome_arquivo) {
+   
+    if (tabela_arquivos.find(nome_arquivo) != tabela_arquivos.end()) {
+        return tabela_arquivos[nome_arquivo].permissao;
+    }
+    return 4; 
+}
+
+// Lembre-se de dar o bind na main do servidor:
+// srv.bind("obter_permissao_arquivo", &obter_permissao_arquivo);
+int registrar_peer(std::string nome_usuario, std::string arquivo,int permissao, int op,int tamanho) {
     if (tabela_arquivos.find(arquivo) == tabela_arquivos.end()) {
         if (op == upload) {
             MetadadosArquivo meta;
@@ -164,7 +174,7 @@ int registrar_peer(std::string nome_usuario, std::string arquivo,int permisao, i
             meta.tamanho_bytes = 0; 
             meta.versao = 1;
             meta.tamanho_bytes = tamanho;  
-            meta.permisao = permisao;      
+            meta.permissao = permissao;      
             meta.usuarios_seeders.push_back(nome_usuario);
             
             tabela_arquivos[arquivo] = meta;
@@ -174,7 +184,7 @@ int registrar_peer(std::string nome_usuario, std::string arquivo,int permisao, i
         }
     } 
     else if(tabela_arquivos[arquivo].criador == nome_usuario){
-        tabela_arquivos[arquivo].permisao = permisao;
+        tabela_arquivos[arquivo].permissao = permissao;
     }
     else{
         auto& seeders = tabela_arquivos[arquivo].usuarios_seeders;
@@ -194,7 +204,7 @@ std::vector<std::pair<std::string, int>> buscar_peers(std::string nome_usuario, 
     std::cout << "O usuario " << nome_usuario << " pede enderecos para o arquivo " << nome_arquivo << "...\n";
     
     if (tabela_arquivos.find(nome_arquivo) != tabela_arquivos.end()) {
-        if(tabela_arquivos[nome_arquivo].permisao != privado || tabela_arquivos[nome_arquivo].criador == nome_usuario){    
+        if(tabela_arquivos[nome_arquivo].permissao != privado || tabela_arquivos[nome_arquivo].criador == nome_usuario){    
             // Colocamos o cadeado AQUI, antes de varrer e acessar a tabela de usuários!
             std::shared_lock<std::shared_mutex> lock_leitura(mtx_usuarios); 
             
@@ -263,6 +273,62 @@ int obter_tamanho_arquivo(std::string arquivo) {
     return 0;
 }
 
+// ======================================================================
+// 1. SOLICITAÇÃO DE EXCLUSÃO (Acionada pelo botão do menu no Cliente)
+// ======================================================================
+int solicitar_exclusao_arquivo(std::string requisitante, std::string nome_arq) {
+    // Se o arquivo não existe, retorna erro
+    if (tabela_arquivos.find(nome_arq) == tabela_arquivos.end()) {
+        return 0; 
+    }
+
+    auto& meta = tabela_arquivos[nome_arq];
+    auto& seeders = meta.usuarios_seeders;
+    seeders.erase(std::remove(seeders.begin(), seeders.end(), requisitante), seeders.end());
+
+    // REGRA DE NEGÓCIO: Só o dono original pode colocar a Lápide (matar para todos)
+    if (meta.criador == requisitante) {
+        meta.versao = -1; // Coloca a Lápide (Tombstone)
+        std::cout << "[TRACKER] Arquivo '" << nome_arq << "' marcado com LAPIDE (v-1) pelo dono (" << requisitante << ").\n";
+        salvar_estado();
+        return 1;
+    } 
+    // Se não for o dono (é um colaborador ou leecher), ele apenas sai da lista
+    else {
+        std::cout << "[TRACKER] Usuario '" << requisitante << "' abandonou o arquivo '" << nome_arq << "'.\n";
+        salvar_estado();
+        return 1;
+    }
+}
+
+// ======================================================================
+// 2. CONFIRMAR REMOÇÃO SEEDER (Acionada pelo Vigia do Cliente)
+// ======================================================================
+int confirmar_remocao_seeder(std::string requisitante, std::string nome_arq) {
+    // Se o arquivo já foi varrido do mapa pelo GC, retorna 0 silenciosamente
+    if (tabela_arquivos.find(nome_arq) == tabela_arquivos.end()) {
+        return 0; 
+    }
+
+    auto& meta = tabela_arquivos[nome_arq];
+    auto& seeders = meta.usuarios_seeders;
+
+    // 1º Passo: Retira o Peer que apagou o arquivo físico da lista de provedores
+    seeders.erase(std::remove(seeders.begin(), seeders.end(), requisitante), seeders.end());
+
+    std::cout << "[TRACKER] Peer '" << requisitante << "' confirmou a remocao fisica de '" << nome_arq << "'.\n";
+
+    // 2º Passo: O GARBAGE COLLECTOR (Coletor de Lixo)
+    // Se o arquivo tem a Lápide (v == -1) E a lista de seeders esvaziou, deleta o metadado
+    if (meta.versao == -1 && seeders.empty()) {
+        tabela_arquivos.erase(nome_arq);
+        std::cout << "[TRACKER] ---> GARBAGE COLLECTION: Arquivo '" << nome_arq << "' deletado permanentemente do BD.\n";
+    }
+
+    salvar_estado(); // Salva o json do servidor atualizado
+    return 1;
+}
+
 int main() {
     rpc::server srv(8000); 
     carregar_estado();
@@ -279,6 +345,9 @@ int main() {
     srv.bind("verificar_versao", &verificar_versao);
     srv.bind("atualizar_ip_usuario",&atualizar_ip_usuario);
     srv.bind("obter_tamanho_arquivo",&obter_tamanho_arquivo);
+    srv.bind("obter_permissao_arquivo",&obter_permissao_arquivo);
+    srv.bind("solicitar_exclusao_arquivo", &solicitar_exclusao_arquivo);
+    srv.bind("confirmar_remocao_seeder", &confirmar_remocao_seeder);
     srv.bind("heartbeat",&heartbeat);
     std::cout << "[TRACKER] Iniciando sistema de Heartbeat...\n";
     //lançamento da thread paralela
