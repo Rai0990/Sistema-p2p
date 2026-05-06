@@ -10,14 +10,11 @@
 #include <chrono>
 #include <utility>
 #include <mutex>
-#include <algorithm> // Necessário para std::find
+#include <algorithm>
 #include <atomic>
-
-// Adição da biblioteca JSON
 #include <nlohmann/json.hpp>
-using json = nlohmann::json;
 
-// Bibliotecas Nativas de Socket do Linux para descobrir o IP
+// funções para uso de portas udp
 #include <unistd.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -28,8 +25,9 @@ using json = nlohmann::json;
 #include "rpc/server.h"
 #include "rpc/client.h"
 
-// abreviações de funções do C++
+using json = nlohmann::json;
 namespace fs = std::filesystem;
+using Endereco = std::pair<std::string, int>; // estrutura para guardar pares de ip e porta
 
 // definições de constantes utilizadas nos códigos
 #define download 1
@@ -38,11 +36,10 @@ namespace fs = std::filesystem;
 #define somente_leitura 4
 #define escrita 5
 
-#define PAGINA 256 // 256 BYTES
+#define PAGINA 64000 // 256 BYTES
+#define PORTA_SERVIDOR 8000
 
-// ========================================================
-// ESTRUTURAS DE DADOS GLOBAIS
-// ========================================================
+// estrutura de dados da tabela local
 struct EstadoLocal {
     int versao;
     std::filesystem::file_time_type ultima_modificacao;
@@ -55,18 +52,15 @@ std::string meu_usuario;
 std::string meu_diretorio;
 std::string meu_ip_atual;
 std::mutex acesso_tabela; 
+std::mutex adiquirir_pagina;
 std::map<std::string, EstadoLocal> meus_arquivos_estados;
-rpc::client tracker("192.168.1.20", 8000); 
+rpc::client tracker("186.217.124.101", 8000); // Endereço e porta do servidor, teria como definir na main, mas teria que ser por ponteiro e toda a estrutura lógica já foi montada sem ser por ponteiro
 
-// === NOVAS VARIÁVEIS DE PROTEÇÃO DO VIGIA ===
+// Variáveis de bloqueio de verificação de arquivos que estão fazendo download
 std::mutex verifica_download;
 bool esta_em_download = false;
 
-
-// ========================================================
-// 0. PERSISTÊNCIA DE DADOS LOCAIS (JSON)
-// ========================================================
-
+// Salvamento dos metadados no formato json
 void salvar_estado_local() {
     std::lock_guard<std::mutex> lock(acesso_tabela); 
     json j;
@@ -116,9 +110,7 @@ void carregar_estado_local() {
     }
 }
 
-// ========================================================
-// BENCHMARK: OUVINTE UDP E FILTRO
-// ========================================================
+// Função teste de performance de peers, com ele é possível ver se o peer consegue fazer a entrega da página no instante i
 void servidor_udp_ping(int porta_rpc_base) {
     int porta_udp = porta_rpc_base + 10000;
     int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
@@ -146,8 +138,7 @@ void servidor_udp_ping(int porta_rpc_base) {
     }
 }
 
-using Endereco = std::pair<std::string, int>;
-
+// declarado como constante pois os ip e portas retornados pelo servidor não vão ser alterados
 std::vector<Endereco> filtrar_peers_por_latencia(const std::vector<Endereco>& peers, int timeout_ms) {
     std::vector<Endereco> peers_aprovados;
     int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
@@ -170,7 +161,7 @@ std::vector<Endereco> filtrar_peers_por_latencia(const std::vector<Endereco>& pe
 
         auto inicio = std::chrono::high_resolution_clock::now();
         sendto(sockfd, "PING", 4, MSG_CONFIRM, (const struct sockaddr *) &servaddr, sizeof(servaddr));
-
+        
         char buffer[10];
         socklen_t len = sizeof(servaddr);
         int n = recvfrom(sockfd, (char *)buffer, 10, MSG_WAITALL, (struct sockaddr *) &servaddr, &len);
@@ -193,9 +184,7 @@ std::vector<Endereco> filtrar_peers_por_latencia(const std::vector<Endereco>& pe
     return peers_aprovados;
 }
 
-// ========================================================
-// 1. DESCOBERTA DE REDE (IP DINÂMICO)
-// ========================================================
+// função de descoberta do ip local da máquina
 std::string obter_meu_ip() {
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (sock < 0) return "127.0.0.1";
@@ -229,6 +218,9 @@ std::string obter_meu_ip() {
 
 // ========================================================
 // 2. LÓGICA DE DOWNLOAD
+// ========================================================
+// ========================================================
+// 2. LÓGICA DE DOWNLOAD (Com Fila Dinâmica e Fallback Justo)
 // ========================================================
 int fazer_download(std::string nome_arq, rpc::client& tracker_ativo) {
     verifica_download.lock();
@@ -278,72 +270,98 @@ int fazer_download(std::string nome_arq, rpc::client& tracker_ativo) {
         std::filesystem::resize_file(caminho_completo, tamanho_total); 
     }
 
-    std::vector<std::thread> threads_download;
     std::mutex trava_escrita_arquivo; 
-    const int MAX_THREADS_SIMULTANEAS = 10; 
+    bool falha_critica = false;
     
-    // Flag global para avisar todas as threads caso uma página não seja encontrada em NENHUM peer
-    std::atomic<bool> falha_critica(false);
-
+    // ========================================================
+    // FILA DINÂMICA DE TRABALHO
+    // ========================================================
+    std::vector<int> paginas_pendentes;
     for (int i = 0; i < num_paginas; i++) {
-        threads_download.push_back(std::thread([&, i]() {
-            if (falha_critica) return; // Se outra thread já acusou falha irrecuperável, aborta a execução
+        paginas_pendentes.push_back(i);
+    }
 
-            bool sucesso = false;
-            std::string peer_usado = "";
+    int rodadas_sem_sucesso = 0;
+    int peer_offset = 0; // Ajuda a rotacionar quem atende qual pedido
 
-            // === LÓGICA DE FALLBACK ===
-            // Tenta baixar a página i de cada peer da lista, começando do índice 0
-            for (size_t p = 0; p < enderecos.size(); ++p) {
-                Endereco peer_alvo = enderecos[p];
+    while (!paginas_pendentes.empty()) {
+        std::vector<std::thread> lote_threads;
+        std::mutex trava_falhas;
+        std::vector<int> paginas_com_falha;
+
+        // Regra de Ouro: O lote NUNCA será maior que o número de peers.
+        // Isso garante no máximo 1 requisição TCP simultânea por peer!
+        int tamanho_lote = std::min((int)paginas_pendentes.size(), (int)enderecos.size());
+
+        for (int i = 0; i < tamanho_lote; i++) {
+            int pagina_atual = paginas_pendentes[i];
+            
+            // Pega um peer da lista e gira o carrossel
+            Endereco peer_alvo = enderecos[(peer_offset + i) % enderecos.size()];
+
+            lote_threads.push_back(std::thread([&, pagina_atual, peer_alvo]() {
+                bool sucesso = false;
                 std::string chave_peer = peer_alvo.first + ":" + std::to_string(peer_alvo.second);
 
                 try {
                     rpc::client outro_peer(peer_alvo.first, peer_alvo.second);
-                    auto dados_pagina = outro_peer.call("transferir_pagina", nome_arq, i).as<std::vector<char>>();
+                    auto dados_pagina = outro_peer.call("transferir_pagina", nome_arq, pagina_atual).as<std::vector<char>>();
 
-                    if (dados_pagina.empty()) {
-                        continue; // O peer não retornou dados (pode estar com arquivo corrompido), tenta o próximo!
+                    if (!dados_pagina.empty()) {
+                        std::lock_guard<std::mutex> lock(trava_escrita_arquivo);
+                        std::fstream arquivo_saida(caminho_completo, std::ios::binary | std::ios::in | std::ios::out);
+                        arquivo_saida.seekp(pagina_atual * PAGINA, std::ios::beg);
+                        arquivo_saida.write(dados_pagina.data(), dados_pagina.size());
+                        sucesso = true; 
                     }
-
-                    std::lock_guard<std::mutex> lock(trava_escrita_arquivo);
-                    std::fstream arquivo_saida(caminho_completo, std::ios::binary | std::ios::in | std::ios::out);
-                    arquivo_saida.seekp(i * PAGINA, std::ios::beg);
-                    arquivo_saida.write(dados_pagina.data(), dados_pagina.size());
-                    
-                    sucesso = true; 
-                    peer_usado = chave_peer;
-                    break; // SUCESSO! Quebra o laço de tentativas, não precisa pedir para os outros peers.
                 } catch (...) {
-                    // Erro de TCP com este peer. Continua silenciosamente o laço para tentar o próximo peer disponível.
+                    // Falhou, 'sucesso' continua false
                 }
-            }
 
-            if (sucesso) {
-                std::lock_guard<std::mutex> lock_stats(trava_estatisticas);
-                estatisticas_download[peer_usado]++;
-            } else {
-                std::cout << "[ERRO] Todos os peers falharam ao fornecer a pagina " << i << ".\n";
-                falha_critica = true; // Aciona o gatilho de aborto para o programa inteiro
-            }
-        }));
-
-        if (threads_download.size() >= MAX_THREADS_SIMULTANEAS) {
-            for (auto& t : threads_download) {
-                if (t.joinable()) t.join();
-            }
-            threads_download.clear(); 
+                if (sucesso) {
+                    std::lock_guard<std::mutex> lock_stats(trava_estatisticas);
+                    estatisticas_download[chave_peer]++;
+                } else {
+                    // Devolve para a fila de espera se deu erro
+                    std::lock_guard<std::mutex> lock_falha(trava_falhas);
+                    paginas_com_falha.push_back(pagina_atual);
+                }
+            }));
         }
-    }
 
-    for (auto& t : threads_download) {
-        if (t.joinable()) t.join();
+        // Espera todo mundo que foi contatado responder (ou dar timeout)
+        for (auto& t : lote_threads) {
+            if (t.joinable()) t.join();
+        }
+
+        // Avança o carrossel para que na próxima rodada os peers peguem páginas diferentes
+        peer_offset = (peer_offset + tamanho_lote) % enderecos.size();
+
+        // Limpa as páginas que já foram tentadas no início da fila
+        paginas_pendentes.erase(paginas_pendentes.begin(), paginas_pendentes.begin() + tamanho_lote);
+
+        // Se houveram falhas, joga elas de volta pro FIM da fila para tentar com outro peer
+        for (int pag_quebrada : paginas_com_falha) {
+            paginas_pendentes.push_back(pag_quebrada);
+        }
+
+        // Sistema Anti-Loop Infinito: Se o lote inteiro falhou e não conseguimos baixar NADA
+        if (paginas_com_falha.size() == tamanho_lote) {
+            rodadas_sem_sucesso++;
+            if (rodadas_sem_sucesso >= 3) { // Desiste após 3 rodadas estéreis consecutivas
+                std::cout << "[ERRO] Multiplos peers falharam. Limite de tentativas excedido.\n";
+                falha_critica = true;
+                break;
+            }
+        } else {
+            rodadas_sem_sucesso = 0; // Tivemos progresso, zera o alerta
+        }
     }
 
     // === VERIFICA SE HOUVE FALHA CRÍTICA ===
     if (falha_critica) {
-        std::cout << "\n[FALHA FATAL] O download nao poude ser concluido. Removendo arquivo corrompido do disco...\n";
-        std::filesystem::remove(caminho_completo); // Exclui o arquivo quebrado
+        std::cout << "\n[FALHA FATAL] O download nao pode ser concluido. Removendo arquivo corrompido do disco...\n";
+        std::filesystem::remove(caminho_completo); 
 
         verifica_download.lock();
         esta_em_download = false;
@@ -356,7 +374,7 @@ int fazer_download(std::string nome_arq, rpc::client& tracker_ativo) {
     std::cout << "          RELATORIO DE DOWNLOAD          \n";
     std::cout << "=========================================\n";
     for (const auto& [peer, paginas_baixadas] : estatisticas_download) {
-        if (paginas_baixadas > 0) { // Mostra apenas os peers que realmente ajudaram
+        if (paginas_baixadas > 0) { 
             double porcentagem = ((double)paginas_baixadas / num_paginas) * 100.0;
             std::cout << "[+] " << peer << " forneceu " << paginas_baixadas << " paginas (";
             printf("%.1f%%", porcentagem); 
@@ -381,7 +399,6 @@ int fazer_download(std::string nome_arq, rpc::client& tracker_ativo) {
 
     return 1;
 }
-
 // ========================================================
 // 3. O VIGIA (THREAD DE BACKGROUND)
 // ========================================================
@@ -390,14 +407,7 @@ void sincronizador_automatico() {
         std::this_thread::sleep_for(std::chrono::seconds(5));
         bool precisa_salvar_json = false; 
 
-        try {
-            std::string ip_verificado = obter_meu_ip();
-            if (ip_verificado != meu_ip_atual) {
-                tracker.call("atualizar_ip_usuario", meu_usuario, ip_verificado);
-                meu_ip_atual = ip_verificado;
-            }
-        } catch (...) {}
-
+        
         for (const auto& entrada : fs::directory_iterator(meu_diretorio)) {
             if (entrada.is_regular_file()) {
                 std::string nome_arq = entrada.path().filename().string();
@@ -406,7 +416,6 @@ void sincronizador_automatico() {
                     continue; 
                 }
 
-                // === A MÁGICA ACONTECE AQUI: IGNORA O QUE ESTÁ SENDO BAIXADO ===
                 bool arquivo_sendo_baixado = false;
                 {
                     verifica_download.lock();
@@ -487,6 +496,9 @@ void sincronizador_automatico() {
 // 4. SERVIDOR DO CLIENTE & FUNÇÕES DO MENU
 // ========================================================
 std::vector<char> transferir_pagina(std::string nome_arquivo, int indice_pagina) {
+
+    std::lock_guard<std::mutex> transferencia(adiquirir_pagina);
+
     std::string caminho_completo = meu_diretorio + "/" + nome_arquivo;
     std::ifstream arquivo(caminho_completo, std::ios::binary);
     
@@ -507,6 +519,7 @@ std::vector<char> transferir_pagina(std::string nome_arquivo, int indice_pagina)
     if (arquivo.read(buffer.data(), tamanho_leitura)) {
         return buffer;
     }
+    adiquirir_pagina.unlock();
     return std::vector<char>();
 }
 
@@ -663,6 +676,26 @@ void inicializar_sistema_de_arquivos() {
     }
 }
 
+
+void prova_vida(){
+   while (true) {
+        std::this_thread::sleep_for(std::chrono::seconds(5));
+        try {
+            // Sinal de vida imune a travamentos de I/O
+            tracker.call("heartbeat",meu_usuario,meu_ip_atual,minha_porta); 
+            
+            // Opcional: Manter a verificação de IP dinâmico aqui também é uma boa prática
+            std::string ip_verificado = obter_meu_ip();
+            if (ip_verificado != meu_ip_atual) {
+                tracker.call("atualizar_ip_usuario", meu_usuario, ip_verificado);
+                meu_ip_atual = ip_verificado;
+            }
+        } catch (...) {
+            // Se o servidor cair, o heartbeat silencia até ele voltar
+        }
+    }
+}
+
 // ========================================================
 // 5. MAIN (INICIALIZAÇÃO)
 // ========================================================
@@ -685,7 +718,7 @@ int main(int argc, char *argv[]) {
 
     rpc::server srv(minha_porta);
     srv.bind("transferir_pagina", &transferir_pagina);
-    srv.async_run(1); 
+    srv.async_run(10); 
     std::cout << "[PEER] Escutando pedidos na porta " << minha_porta << "...\n";
 
     std::thread thread_udp(servidor_udp_ping, minha_porta);
@@ -694,6 +727,9 @@ int main(int argc, char *argv[]) {
 
     std::thread thread_sync(sincronizador_automatico); 
     thread_sync.detach(); 
+
+    std::thread thread_hertbeat(prova_vida);
+    thread_hertbeat.detach();
 
     int op = 0; 
     while(op != -1){
